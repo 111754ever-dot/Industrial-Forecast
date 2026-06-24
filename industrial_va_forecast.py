@@ -112,6 +112,16 @@ class Config:
     feature_lags: tuple = (1, 2, 3)  # 月度特征滞后阶
     target_ar_lags: tuple = (1, 2, 3, 12)  # 目标自回归滞后
 
+    # ---- 抗过拟合 ----
+    # MIDAS/LightGBM 的训练窗口上限(月)。限定近 N 年，避免：(1)被中位数填充的远古高频
+    # 特征污染；(2)1990年代/疫情等结构断点造成的体制错配。DFM 不受此限(它原生吃缺失、
+    # 且因子估计受益于长历史)。156 月 = 13 年，覆盖绝大多数高频指标的真实起点。
+    max_train_months: int = 156
+    midas_topk_features: int = 40    # MIDAS 入模前按|相关|预筛的特征数(降维抗过拟合)
+    midas_use_isna_flags: bool = False  # 是否保留缺失指示列(默认关:它们多为噪声)
+    ensemble_exclude_janfeb_in_weights: bool = True  # 组合权重按"剔除1-2月"误差计算
+    sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
+
     # ---- 模型 ----
     dfm_factors: int = 2             # DFM 共同因子个数
     dfm_factor_order: int = 2        # 因子 VAR 阶
@@ -705,52 +715,79 @@ class ModelMIDAS(BaseModel):
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def _prep(self, feat: pd.DataFrame):
-        from sklearn.preprocessing import StandardScaler
-        y = feat["__target__"]
-        X = feat.drop(columns="__target__")
-        # 缺失指示
-        miss = X.isna().astype(float)
-        miss.columns = [f"{c}__isna" for c in miss.columns]
-        # 中位数填补；对训练段整列皆缺的列，残余填 0
-        med = X.median(numeric_only=True)
+    def _prep(self, feat: pd.DataFrame, cols: Optional[list] = None,
+              med: Optional[pd.Series] = None):
+        """构造填补后的特征矩阵。cols 给定则只用这些列（保证训练/测试列一致）。
+        med 给定则用外部(训练集)中位数填补——测试行必须用训练中位数，否则单行中位数
+        会把缺失项错误地填成极端值。"""
+        cfg = self.cfg
+        y = feat["__target__"] if "__target__" in feat.columns else None
+        X = feat.drop(columns="__target__") if y is not None else feat.copy()
+        if cols is not None:
+            X = X[cols]
+        if med is None:
+            med = X.median(numeric_only=True)
         Xf = X.fillna(med).fillna(0.0)
-        Xall = pd.concat([Xf, miss], axis=1)
-        Xall = Xall.replace([np.inf, -np.inf], 0.0)
-        return Xall, y, med
+        if cfg.midas_use_isna_flags:
+            miss = X.isna().astype(float)
+            miss.columns = [f"{c}__isna" for c in miss.columns]
+            Xf = pd.concat([Xf, miss], axis=1)
+        Xf = Xf.replace([np.inf, -np.inf], 0.0)
+        return Xf, y, med
 
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
         from sklearn.linear_model import ElasticNetCV
         from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
         cfg = self.cfg
         feat = ctx.features_asof(as_of)
         if target_month not in feat.index:
             return None
 
         train = feat.loc[:target_month].iloc[:-1].dropna(subset=["__target__"])
+        # 抗过拟合 1：限定训练窗口（去掉被中位数填充的远古高频数据 + 体制断点）
+        if len(train) > cfg.max_train_months:
+            train = train.iloc[-cfg.max_train_months:]
         if len(train) < cfg.backtest_min_train // 2:
             return None
-        test_row = feat.loc[[target_month]].drop(columns="__target__")
 
-        Xall, y, med = self._prep(pd.concat([train, feat.loc[[target_month]]]))
-        Xtr = Xall.iloc[:-1]
-        ytr = y.iloc[:-1]
-        Xte = Xall.iloc[[-1]]
+        # 抗过拟合 2：按 |相关| 预筛 top-K 特征（降维），仅用训练段计算，无前视
+        Xtr_raw = train.drop(columns="__target__")
+        ytr = train["__target__"]
+        # 候选列：在训练窗口内有足够非缺失的列
+        valid_cols = [c for c in Xtr_raw.columns
+                      if Xtr_raw[c].notna().sum() >= max(24, len(train) // 3)]
+        corr = {}
+        for c in valid_cols:
+            v = Xtr_raw[c]
+            m = v.notna() & ytr.notna()
+            if m.sum() >= 24 and v[m].std() > 1e-9:
+                corr[c] = abs(np.corrcoef(v[m], ytr[m])[0, 1])
+        top_cols = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                         reverse=True)[:cfg.midas_topk_features]]
+        if len(top_cols) < 3:
+            return None
 
-        # 标准化
+        Xtr, y, med = self._prep(train, cols=top_cols)
+        # 测试行用【训练集】中位数填补（关键：避免单行中位数把缺失填成极端值）
+        Xte, _, _ = self._prep(feat.loc[[target_month]], cols=top_cols, med=med)
+
         scaler = StandardScaler()
         Xtr_s = scaler.fit_transform(Xtr.values)
         Xte_s = scaler.transform(Xte.values)
 
         try:
-            model = ElasticNetCV(l1_ratio=list(cfg.enet_l1_ratios), cv=5,
-                                 max_iter=20000, n_jobs=-1,
+            # 抗过拟合 3：时序交叉验证（尊重时间顺序，避免用未来折选 alpha）
+            tscv = TimeSeriesSplit(n_splits=5)
+            model = ElasticNetCV(l1_ratio=list(cfg.enet_l1_ratios), cv=tscv,
+                                 max_iter=50000, n_jobs=-1,
                                  random_state=cfg.random_state)
             model.fit(Xtr_s, ytr.values)
             point = float(model.predict(Xte_s)[0])
             resid = ytr.values - model.predict(Xtr_s)
             sigma = float(np.std(resid, ddof=1))
             out = Prediction(point=point, sigma=sigma)
+            out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
             from scipy.stats import norm
             for lv in cfg.interval_levels:
                 z = norm.ppf(0.5 + lv / 2)
@@ -781,6 +818,9 @@ class ModelLGB(BaseModel):
         if target_month not in feat.index:
             return None
         train = feat.loc[:target_month].iloc[:-1].dropna(subset=["__target__"])
+        # 抗过拟合：限定训练窗口
+        if len(train) > cfg.max_train_months:
+            train = train.iloc[-cfg.max_train_months:]
         if len(train) < cfg.backtest_min_train // 2:
             return None
 
@@ -788,10 +828,13 @@ class ModelLGB(BaseModel):
         ytr = train["__target__"]
         Xte = feat.loc[[target_month]].drop(columns="__target__")
 
+        # 抗过拟合：大幅加正则——更浅的树、更少叶子、更高最小样本、更强 L1/L2、
+        # 列/行下采样、最小分裂增益门槛，并限制 n_estimators。
         params_common = dict(
-            n_estimators=600, learning_rate=0.02, num_leaves=31,
-            min_child_samples=10, subsample=0.8, subsample_freq=1,
-            colsample_bytree=0.7, reg_lambda=1.0, reg_alpha=0.5,
+            n_estimators=250, learning_rate=0.03, num_leaves=8, max_depth=3,
+            min_child_samples=30, min_split_gain=0.02,
+            subsample=0.7, subsample_freq=1, colsample_bytree=0.5,
+            reg_lambda=5.0, reg_alpha=2.0,
             random_state=cfg.random_state, n_jobs=-1, verbose=-1,
         )
         try:
@@ -1052,14 +1095,17 @@ class Ensemble:
     def fit(self, bt: pd.DataFrame):
         cfg = self.cfg
         y = bt["y_true"].values
-        # 1) 计算各模型逆误差权重
+        jf = bt["is_jan_feb"].values
+        # 1) 计算各模型逆误差权重。默认按"剔除1-2月"误差计算——1-2月拆分值是不可预测
+        #    的人造噪声，若计入会让权重被噪声主导、奖励到对噪声偶然拟合的模型。
+        weight_mask_base = (~jf) if cfg.ensemble_exclude_janfeb_in_weights else np.ones_like(jf, bool)
         rmses = {}
         for name in self.model_names:
             col = f"{name}__point"
             if col not in bt:
                 continue
             p = bt[col].values
-            m = np.isfinite(y) & np.isfinite(p)
+            m = np.isfinite(y) & np.isfinite(p) & weight_mask_base
             if m.sum() >= 6:
                 rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
         if not rmses:
@@ -1171,10 +1217,19 @@ class Reporter:
                     pm.update(interval_metrics(y, bt[lo_c].values, bt[hi_c].values, lv))
             pm["model"] = name
             rows.append(pm)
-            # 1/2 月单列
+            # 剔除 1-2 月（真正衡量可预测月份的表现）
             jf = bt["is_jan_feb"].values
+            pm_ex = point_metrics(y[~jf], bt[col].values[~jf], naive[~jf])
+            for lv in cfg.interval_levels:
+                lo_c, hi_c = f"{name}__lo{int(lv*100)}", f"{name}__hi{int(lv*100)}"
+                if lo_c in bt and hi_c in bt:
+                    pm_ex.update(interval_metrics(y[~jf], bt[lo_c].values[~jf],
+                                                  bt[hi_c].values[~jf], lv))
+            pm_ex["model"] = name + "(剔除1-2月)"
+            rows.append(pm_ex)
+            # 仅 1/2 月单列
             pm_jf = point_metrics(y[jf], bt[col].values[jf])
-            pm_jf["model"] = name + "(1-2月)"
+            pm_jf["model"] = name + "(仅1-2月)"
             rows.append(pm_jf)
         ev = pd.DataFrame(rows).set_index("model")
         path = os.path.join(cfg.out_dir, "evaluation_metrics.csv")
@@ -1202,6 +1257,52 @@ class Reporter:
             os.path.join(cfg.out_dir, "forecast_result.csv"),
             index=False, encoding="utf-8-sig")
         return rec
+
+    def plot_backtest(self, bt: pd.DataFrame, model_names: list[str]):
+        """回测时间序列图：实际 vs 各模型 vs 组合，并标注 1-2 月；下方为预测误差。
+        这是直观判断预测效果与过拟合的主图。"""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
+            return
+        styles = {"DFM": ("#d62728", "-"), "MIDAS_ENet": ("#1f77b4", "--"),
+                  "LightGBM": ("#2ca02c", "-."), "SARIMA": ("#9467bd", ":"),
+                  "ENSEMBLE": ("#ff7f0e", "-")}
+        fig, axes = plt.subplots(2, 1, figsize=(15, 10),
+                                 gridspec_kw={"height_ratios": [2, 1]})
+        ax = axes[0]
+        ax.plot(bt.index, bt["y_true"], "k-o", ms=5, lw=2.2, label="Actual", zorder=10)
+        for name in list(model_names) + ["ENSEMBLE"]:
+            col = f"{name}__point"
+            if col in bt:
+                c, ls = styles.get(name, ("grey", "-"))
+                ax.plot(bt.index, bt[col], color=c, ls=ls, marker=".",
+                        lw=3 if name == "ENSEMBLE" else 1.3, label=name)
+        # 标注 1-2 月
+        for ts in bt.index[bt["is_jan_feb"].values]:
+            ax.axvspan(ts - pd.Timedelta(days=15), ts + pd.Timedelta(days=15),
+                       color="orange", alpha=0.08)
+        ax.set_title("Backtest (pseudo real-time): Industrial VA YoY — Actual vs Models"
+                     "  [shaded = Jan/Feb, structurally noisy]")
+        ax.set_ylabel("YoY %"); ax.grid(alpha=0.3); ax.axhline(0, color="grey", lw=0.5)
+        ax.legend(ncol=3, fontsize=9)
+        ax2 = axes[1]
+        for name in list(model_names) + ["ENSEMBLE"]:
+            col = f"{name}__point"
+            if col in bt:
+                c, ls = styles.get(name, ("grey", "-"))
+                ax2.plot(bt.index, bt[col] - bt["y_true"], color=c, ls=ls, marker=".",
+                         lw=3 if name == "ENSEMBLE" else 1.2, label=name)
+        ax2.axhline(0, color="k", lw=0.8)
+        ax2.set_title("Prediction error (pred - actual), pp"); ax2.grid(alpha=0.3)
+        ax2.legend(ncol=3, fontsize=8)
+        fig.autofmt_xdate(); fig.tight_layout()
+        path = os.path.join(self.cfg.out_dir, "backtest_timeseries.png")
+        fig.savefig(path, dpi=130, bbox_inches="tight"); plt.close(fig)
+        LOG.info("已保存回测时间序列图：%s", path)
 
     def plot_fan_chart(self, bt: pd.DataFrame, target_month, point, intervals):
         try:
@@ -1268,6 +1369,24 @@ class Reporter:
 # ==============================================================================
 # 第 15 节  驱动分解
 # ==============================================================================
+def sanity_clip(point: float, raw: dict, cfg: Config,
+                target_month: pd.Timestamp) -> tuple:
+    """极端值护栏：把点预测限制在"近12个月实际值范围 ± sanity_clip_pp"内。
+    防止 ML/桥接模型在基数效应/春节交互下产生 17~18 这类离谱外推。
+    返回 (clipped_point, was_clipped)。1-2月放宽护栏(其本身波动极大)。
+    """
+    s = raw[cfg.sheet_target].set_index("date")[
+        "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
+    s.index = to_month_index(s.index)
+    recent = s.loc[:target_month].tail(12)
+    if len(recent) < 6:
+        return point, False
+    pad = cfg.sanity_clip_pp * (2.5 if target_month.month in (1, 2) else 1.0)
+    lo, hi = recent.min() - pad, recent.max() + pad
+    clipped = float(np.clip(point, lo, hi))
+    return clipped, (abs(clipped - point) > 1e-6)
+
+
 def extract_drivers(per_model: dict, top_k: int = 12) -> list:
     """从 LightGBM 特征重要度给出主要驱动因子（业务可解释）。"""
     lgb_pred = per_model.get("LightGBM")
@@ -1328,6 +1447,7 @@ def main(cfg: Config = CFG):
     bt_full = reporter.save_backtest(bt, ens)
     ev = reporter.evaluation_table(bt_full, model_names)
     LOG.info("\n===== 回测评估 =====\n%s", ev.round(3).to_string())
+    reporter.plot_backtest(bt_full, model_names)
 
     # 7) 实盘预测：下一个未发布月
     target_month = detect_target_month(raw, cfg)
@@ -1347,6 +1467,11 @@ def main(cfg: Config = CFG):
     if point is None:
         LOG.error("所有模型均未给出有效预测，终止。")
         return
+    point_raw = point
+    point, clipped = sanity_clip(point, raw, cfg, target_month)
+    if clipped:
+        LOG.warning("极端值护栏触发：组合点预测 %.2f -> %.2f（限制在近12月范围±%.1f）",
+                    point_raw, point, cfg.sanity_clip_pp)
     intervals = ens.interval_for(point, target_month)
     drivers = extract_drivers(per_model)
 
