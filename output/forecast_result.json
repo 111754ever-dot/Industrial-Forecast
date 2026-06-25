@@ -1,0 +1,64 @@
+{
+  "target_month": "2026-05-31",
+  "point_forecast": 5.138,
+  "lower_80": 3.623,
+  "upper_80": 6.653,
+  "lower_95": 2.173,
+  "upper_95": 8.103,
+  "per_model": {
+    "DFM": 6.547,
+    "MIDAS_ENet": 2.5,
+    "LightGBM": 5.41,
+    "SARIMA": 4.446
+  },
+  "top_drivers": [
+    {
+      "feature": "house_sale_30_t0",
+      "gain_share": 0.224
+    },
+    {
+      "feature": "steel_rolled_key_t0",
+      "gain_share": 0.142
+    },
+    {
+      "feature": "port_cfd_t0",
+      "gain_share": 0.111
+    },
+    {
+      "feature": "pmi_newexport_t0",
+      "gain_share": 0.102
+    },
+    {
+      "feature": "power_yoy_t0",
+      "gain_share": 0.069
+    },
+    {
+      "feature": "prod_rebar_mill_t0",
+      "gain_share": 0.067
+    },
+    {
+      "feature": "port_qhd_t0",
+      "gain_share": 0.057
+    },
+    {
+      "feature": "power_yoy_l1",
+      "gain_share": 0.054
+    },
+    {
+      "feature": "prod_power_equip_l2",
+      "gain_share": 0.051
+    },
+    {
+      "feature": "util_pet_chip_t0",
+      "gain_share": 0.042
+    },
+    {
+      "feature": "steel_crude_est_t0",
+      "gain_share": 0.041
+    },
+    {
+      "feature": "retail_yoy_l1",
+      "gain_share": 0.041
+    }
+  ]
+}

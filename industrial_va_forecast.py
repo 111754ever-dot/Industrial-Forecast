@@ -707,8 +707,14 @@ class ModelDFM(BaseModel):
 # 8.2  正则化 MIDAS / 桥接（弹性网）
 # ------------------------------------------------------------------------------
 class ModelMIDAS(BaseModel):
-    """U-MIDAS 思路：高频已聚合为月度并构造滞后（第 7 节），弹性网做带正则的桥接回归。
-    缺失：中位数填补 + 缺失指示列。区间：残差正态近似（最终由共形覆盖）。
+    """U-MIDAS / 桥接回归（弹性网）。
+
+    缺失处理（已升级为桥接回归标准做法，不再靠中位数硬填）：
+      只选取【在预测时点 target_month 真正可观测】且训练段覆盖充分的特征作为候选。
+      于是预测当月尚未发布的月度宏观当期值(_t0)被自动排除，模型改用它们的滞后项
+      (T-1 已发布)与当月高频特征——这正是桥接方程应有的信息集。如此一来测试行无需
+      任何填补，训练段残留的零星缺失才用中位数兜底(占比极小、风险可忽略)。
+    区间：训练残差正态近似（最终由组合层共形校准）。
     """
     name = "MIDAS_ENet"
 
@@ -751,12 +757,15 @@ class ModelMIDAS(BaseModel):
         if len(train) < cfg.backtest_min_train // 2:
             return None
 
-        # 抗过拟合 2：按 |相关| 预筛 top-K 特征（降维），仅用训练段计算，无前视
+        # 缺失处理核心：候选特征必须【在预测点可观测】+【训练段覆盖充分】，
+        # 再按 |相关| 预筛 top-K（降维，仅用训练段计算，无前视）。
         Xtr_raw = train.drop(columns="__target__")
         ytr = train["__target__"]
-        # 候选列：在训练窗口内有足够非缺失的列
+        test_row = feat.loc[target_month].drop(labels="__target__")
+        min_cov = max(24, len(train) // 3)
         valid_cols = [c for c in Xtr_raw.columns
-                      if Xtr_raw[c].notna().sum() >= max(24, len(train) // 3)]
+                      if pd.notna(test_row[c])                      # 预测点可观测
+                      and Xtr_raw[c].notna().sum() >= min_cov]      # 训练覆盖充分
         corr = {}
         for c in valid_cols:
             v = Xtr_raw[c]

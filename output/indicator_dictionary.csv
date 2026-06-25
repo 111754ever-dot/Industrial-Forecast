@@ -1,0 +1,46 @@
+﻿key,name,sheet,transform,dfm_tier,role,note
+IVA_yoy,中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分),工业增加值,target,True,target,目标：1-2月【拆分】口径，与社零的【合并】口径不同，勿混用
+retail_yoy,中国:社会消费品零售总额:当月同比(1-2月合并),月度,yoy_keep,True,predictor,1-2月【合并】口径；与目标拆分口径不同，1/2月对齐需谨慎
+fai_cum,中国:固定资产投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：先还原当月值再算当月同比；勿当水平值；1月空、2月为1-2合并
+reinv_cum,中国:房地产开发投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：同上还原；与固投累计值是两条近名指标，勿混
+pmi,中国:制造业PMI,月度,rate,True,predictor,荣枯线50
+pmi_neworder,中国:制造业PMI:新订单,月度,rate,True,predictor,PMI 子项-新订单，勿与下面新出口订单混
+pmi_newexport,中国:制造业PMI:新出口订单,月度,rate,True,predictor,PMI 子项-新出口订单
+power_yoy,中国:发电量:当月同比,月度,yoy_keep,True,predictor,发电量当月同比，与工业生产高度同步
+ppi_yoy,中国:PPI:当月同比,月度,yoy_keep,True,predictor,
+ppirm_yoy,中国:PPIRM:当月同比,月度,yoy_keep,True,predictor,PPIRM(生产资料购进价)，勿与 PPI 混
+pmi_rawprice,中国:制造业PMI:主要原材料购进价格,月度,rate,True,predictor,PMI 价格子项
+prod_ic,中国:产量:集成电路:当月值,月度,level2yoy,True,predictor,当月值水平量 -> 同比
+prod_power_equip,中国:产量:发电设备:当月值,月度,level2yoy,True,predictor,当月值水平量 -> 同比
+steel_crude_key,中国:日均产量:粗钢:重点企业,旬度,level2yoy,True,predictor,重点企业粗钢日均产量；勿与下面'预估日均产量:粗钢'混
+steel_crude_est,中国:预估日均产量:粗钢,旬度,level2yoy,True,predictor,全国预估粗钢日均产量（不同来源）
+steel_rolled_key,中国:日均产量:钢材:重点企业,旬度,level2yoy,True,predictor,重点企业钢材日均产量
+steel_pig_key,中国:日均产量:生铁:重点企业,旬度,level2yoy,True,predictor,重点企业生铁日均产量
+util_tire_semi,中国:开工率:汽车轮胎(半钢胎),周度,rate,True,predictor,半钢胎；与全钢胎成对近名，勿混
+util_tire_full,中国:开工率:汽车轮胎(全钢胎),周度,rate,True,predictor,全钢胎
+util_pet_chip,中国:开工率:聚酯切片,周度,rate,True,predictor,
+util_asphalt,中国:开工率:石油沥青装置,周度,rate,True,predictor,
+prod_rebar_mill,中国:产量:螺纹钢:主要钢厂,周度,level2yoy,True,predictor,主要钢厂螺纹钢产量(水平量->同比)
+util_rebar_mill,中国:开工率:螺纹钢:主要钢厂,周度,rate,True,predictor,螺纹钢开工率(比率)；与上面螺纹钢产量是两条不同指标
+land_area_100,中国:100大中城市:成交土地占地面积,周度,level2yoy,True,predictor,成交土地面积(水平量->同比)；地产前瞻
+scfi,中国:上海出口集装箱运价指数:综合指数,周度,index2yoy,True,predictor,SCFI 运价指数->同比
+steel_price_idx,中国:钢材综合价格指数,周度,index2yoy,True,predictor,钢材综合价格指数->同比
+coal_south_plant,中国:南方电厂:日耗量:煤炭,周度,level2yoy,False,predictor,2022年才有：剔出DFM核心集，仅供ML
+coal_key_plant,中国:日耗量:煤炭重点电厂,周度,level2yoy,False,predictor,2022年才有：仅供ML；与统调/南方电厂三条近名，勿混
+coal_unified_plant,中国:日耗量:煤炭统调电厂,周度,level2yoy,False,predictor,2022年才有：仅供ML
+car_retail,"中国:日均销量(当周,厂家零售):乘用车",周度,level2yoy,True,predictor,乘用车厂家【零售】；与下面【批发】成对近名，勿混
+car_wholesale,"中国:日均销量(当周,厂家批发):乘用车",周度,level2yoy,True,predictor,乘用车厂家【批发】
+cement_ship,中国:发运率:水泥,周度,rate,True,predictor,水泥发运率(比率)
+mill_run,中国:运转率:磨机,周度,rate,True,predictor,磨机运转率(比率)
+util_poly_loom,中国:江浙地区:开工率:涤纶长丝:下游织机,周度,rate,True,predictor,下游织机开工率；与下面涤纶长丝本体成对近名，勿混
+util_poly,中国:江浙地区:开工率:涤纶长丝,周度,rate,True,predictor,涤纶长丝开工率
+bf_tangshan,中国:唐山:高炉开工率,周度,rate,True,predictor,唐山高炉开工率
+util_pta,中国:开工率:精对苯二甲酸,日度,rate,True,predictor,PTA 开工率(比率)
+house_sale_30,中国:30大中城市:成交面积:商品房,日度,level2yoy,True,predictor,30城商品房成交面积(水平量->同比)；地产需求高频
+bdi,波罗的海干散货指数(BDI),日度,index2yoy,True,predictor,BDI 干散货运价->同比
+nh_index,南华综合指数,日度,index2yoy,True,predictor,南华商品综合指数->同比
+rebar_price,"中国:价格:螺纹钢(HRB400E,20mm)",日度,index2yoy,True,predictor,螺纹钢现货价->同比
+cement_price_idx,中国:水泥价格指数,日度,index2yoy,True,predictor,水泥价格指数->同比
+port_qhd,中国:秦皇岛港:港口吞吐量:煤炭,日度,level2yoy,True,predictor,秦皇岛港煤炭吞吐量(水平量->同比)；与曹妃甸/京唐三港近名，勿混
+port_cfd,中国:曹妃甸港:煤炭调度:港口吞吐量,日度,level2yoy,True,predictor,曹妃甸港煤炭吞吐量
+port_jt,中国:京唐老港:港口吞吐量:煤炭,日度,level2yoy,True,predictor,京唐老港煤炭吞吐量
