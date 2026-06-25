@@ -8,15 +8,7 @@
   "per_model": {
     "AR": 4.757,
     "LocalLevel": 5.2,
-    "ETS": 4.543,
-    "UCM": 4.511,
-    "SARIMA": 4.446,
-    "ARX": 3.972,
-    "PLS": 3.986,
-    "MIDAS_ENet": 6.621,
-    "Anchor+HF": 4.706,
-    "DFM": 6.557,
-    "LightGBM": 5.312
+    "ARX": 3.972
   },
   "top_drivers": {
     "ensemble_composition": [
@@ -33,7 +25,54 @@
         "weighted_contribution": 2.314
       }
     ],
-    "feature_drivers": [],
+    "feature_drivers": [
+      {
+        "model": "ARX",
+        "weight": 0.514,
+        "top_features": [
+          {
+            "feature": "arlag3",
+            "coef": 0.787
+          },
+          {
+            "feature": "retail_yoy_l1",
+            "coef": 0.755
+          },
+          {
+            "feature": "arlag1",
+            "coef": 0.622
+          },
+          {
+            "feature": "reinv_cum_l1",
+            "coef": 0.413
+          },
+          {
+            "feature": "util_tire_semi_l2",
+            "coef": 0.381
+          },
+          {
+            "feature": "arlag2",
+            "coef": 0.362
+          },
+          {
+            "feature": "steel_crude_key_t0",
+            "coef": 0.337
+          },
+          {
+            "feature": "pmi_newexport_l2",
+            "coef": -0.24
+          },
+          {
+            "feature": "retail_yoy_l2",
+            "coef": -0.193
+          },
+          {
+            "feature": "land_area_100_l1",
+            "coef": 0.187
+          }
+        ]
+      }
+    ],
     "note": ""
   }
 }

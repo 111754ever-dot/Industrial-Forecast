@@ -17,15 +17,17 @@
 * 频率不一致：四种频率全部"对齐到月"，高频指标按"真实时点可得"聚合（均值/月末值/
   月内进度），杜绝前视偏差。
 * 样本长度不一致：**绝不截断到统一起止日期**（那样会被 2022 年才开始的指标拖到只剩
-  3 年样本，丢掉 30 年历史）。改用：
-    - MF-DFM（状态空间 + Kalman + EM）原生吃缺失/不等长（分层：只用长且完整的指标）；
-    - LightGBM 原生处理缺失（吸收很新/很稀疏的指标，如 2022 年才有的煤耗）；
-    - MIDAS/弹性网用"可用即用 + 缺失指示 + 中位数填补"。
-* 1-2 月：按既定决策"直接预测拆分值 + 春节哑变量"。拆分单月是人造噪声，故 1/2 月会
-  自动加宽区间，并在回测里单列其表现。
-* 既要点又要区间：每个模型自带分布；最终用逆误差加权组合点预测，区间用"对组合回测
-  残差做分裂共形(split conformal)校准"，保证经验覆盖达标且不过窄。
-* 多模型组合：MF-DFM（主力）+ 正则化MIDAS + LightGBM(分位数) + SARIMA(基准)。
+  3 年样本，丢掉 30 年历史）。改用：真实时点(vintage)对齐 + 各模型按能力处理缺失
+  （AR/LocalLevel 仅用目标自身；ARX 用"预测点可观测 + 训练覆盖充分"的高频，无需硬填）。
+* 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
+* 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
+  conformal)校准"，保证经验覆盖达标且不过窄。
+* 模型集合（经 DM 检验严格筛选后定稿）：
+    - 核心(默认运行、进组合)：AR(p,基准/锚) + LocalLevel(朴素地板) + ARX(锚定高频桥接)；
+    - 探针(默认关闭)：DFM + LightGBM，机制最独特的高频/非线性模型，仅用于监测"高频指标
+      是否重新跑赢 AR"的 regime 信号，不参与默认预测。
+  说明：经无泄漏回测 + Diebold-Mariano 检验证实，在"当月同比"与"累计同比"两种口径下，
+  高频指标均未显著超越 AR——故复杂高频模型降为探针，体系以"目标自身历史"为主。
 
 真实时点（ragged edge）口径
 --------------------------
@@ -115,14 +117,19 @@ class Config:
     target_ar_lags: tuple = (1, 2, 3, 12)  # 目标自回归滞后
 
     # ---- 抗过拟合 ----
-    # MIDAS/LightGBM 的训练窗口上限(月)。限定近 N 年，避免：(1)被中位数填充的远古高频
+    # 桥接模型(ARX)的训练窗口上限(月)。限定近 N 年，避免：(1)被中位数填充的远古高频
     # 特征污染；(2)1990年代/疫情等结构断点造成的体制错配。DFM 不受此限(它原生吃缺失、
     # 且因子估计受益于长历史)。156 月 = 13 年，覆盖绝大多数高频指标的真实起点。
     max_train_months: int = 156
-    midas_topk_features: int = 40    # MIDAS 入模前按|相关|预筛的特征数(降维抗过拟合)
-    midas_use_isna_flags: bool = False  # 是否保留缺失指示列(默认关:它们多为噪声)
+    bridge_topk_features: int = 40   # 桥接模型入模前按|相关|预筛的特征数(降维抗过拟合)
     ensemble_exclude_janfeb_in_weights: bool = True  # 组合权重按"剔除1-2月"误差计算
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
+
+    # ---- 模型集合 ----
+    # 核心(默认运行、进DM门控组合): AR(基准) + LocalLevel(朴素地板) + ARX(锚定高频桥接)。
+    # 探针(默认关闭): DFM/LightGBM——机制最独特的高频/非线性模型，平时不跑(慢)；开启后参与
+    # DM 检验，用于监测"高频指标是否重新跑赢 AR"(regime 变化信号)，不影响默认预测。
+    enable_probe_models: bool = False
 
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
@@ -604,7 +611,7 @@ def spring_festival_features(index: pd.DatetimeIndex) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 第 7 节  特征矩阵（供 MIDAS/弹性网 与 LightGBM 使用）
+# 第 7 节  特征矩阵（供 ARX 与 LightGBM 等桥接模型使用）
 # ==============================================================================
 class FeatureBuilder:
     """由月度面板构造监督学习特征矩阵：滞后、目标自回归、基数、春节。"""
@@ -748,117 +755,6 @@ class ModelDFM(BaseModel):
         except Exception as e:
             LOG.warning("DFM 在 %s 失败：%s", target_month.date(), e)
             return None
-
-
-# ------------------------------------------------------------------------------
-# 8.2  正则化 MIDAS / 桥接（弹性网）
-# ------------------------------------------------------------------------------
-class ModelMIDAS(BaseModel):
-    """U-MIDAS / 桥接回归（弹性网）。
-
-    缺失处理（已升级为桥接回归标准做法，不再靠中位数硬填）：
-      只选取【在预测时点 target_month 真正可观测】且训练段覆盖充分的特征作为候选。
-      于是预测当月尚未发布的月度宏观当期值(_t0)被自动排除，模型改用它们的滞后项
-      (T-1 已发布)与当月高频特征——这正是桥接方程应有的信息集。如此一来测试行无需
-      任何填补，训练段残留的零星缺失才用中位数兜底(占比极小、风险可忽略)。
-    区间：训练残差正态近似（最终由组合层共形校准）。
-    """
-    name = "MIDAS_ENet"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def _prep(self, feat: pd.DataFrame, cols: Optional[list] = None,
-              med: Optional[pd.Series] = None):
-        """构造填补后的特征矩阵。cols 给定则只用这些列（保证训练/测试列一致）。
-        med 给定则用外部(训练集)中位数填补——测试行必须用训练中位数，否则单行中位数
-        会把缺失项错误地填成极端值。"""
-        cfg = self.cfg
-        y = feat["__target__"] if "__target__" in feat.columns else None
-        X = feat.drop(columns="__target__") if y is not None else feat.copy()
-        if cols is not None:
-            X = X[cols]
-        if med is None:
-            med = X.median(numeric_only=True)
-        Xf = X.fillna(med).fillna(0.0)
-        if cfg.midas_use_isna_flags:
-            miss = X.isna().astype(float)
-            miss.columns = [f"{c}__isna" for c in miss.columns]
-            Xf = pd.concat([Xf, miss], axis=1)
-        Xf = Xf.replace([np.inf, -np.inf], 0.0)
-        return Xf, y, med
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from sklearn.linear_model import ElasticNetCV
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import TimeSeriesSplit
-        cfg = self.cfg
-        feat = ctx.realtime_feature_matrix()  # 真实时点矩阵:训练/预测信息集一致
-        if target_month not in feat.index:
-            return None
-
-        train = feat.loc[:target_month].iloc[:-1].dropna(subset=["__target__"])
-        # 抗过拟合 1：限定训练窗口（去掉被中位数填充的远古高频数据 + 体制断点）
-        if len(train) > cfg.max_train_months:
-            train = train.iloc[-cfg.max_train_months:]
-        if len(train) < cfg.backtest_min_train // 2:
-            return None
-
-        # 缺失处理核心：候选特征必须【在预测点可观测】+【训练段覆盖充分】，
-        # 再按 |相关| 预筛 top-K（降维，仅用训练段计算，无前视）。
-        Xtr_raw = train.drop(columns="__target__")
-        ytr = train["__target__"]
-        test_row = feat.loc[target_month].drop(labels="__target__")
-        min_cov = max(24, len(train) // 3)
-        valid_cols = [c for c in Xtr_raw.columns
-                      if pd.notna(test_row[c])                      # 预测点可观测
-                      and Xtr_raw[c].notna().sum() >= min_cov]      # 训练覆盖充分
-        corr = {}
-        for c in valid_cols:
-            v = Xtr_raw[c]
-            m = v.notna() & ytr.notna()
-            if m.sum() >= 24 and v[m].std() > 1e-9:
-                corr[c] = abs(np.corrcoef(v[m], ytr[m])[0, 1])
-        top_cols = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
-                                         reverse=True)[:cfg.midas_topk_features]]
-        if len(top_cols) < 3:
-            return None
-
-        Xtr, y, med = self._prep(train, cols=top_cols)
-        # 测试行用【训练集】中位数填补（关键：避免单行中位数把缺失填成极端值）
-        Xte, _, _ = self._prep(feat.loc[[target_month]], cols=top_cols, med=med)
-
-        scaler = StandardScaler()
-        Xtr_s = scaler.fit_transform(Xtr.values)
-        Xte_s = scaler.transform(Xte.values)
-
-        try:
-            # 抗过拟合 3：时序交叉验证（尊重时间顺序，避免用未来折选 alpha）
-            tscv = TimeSeriesSplit(n_splits=5)
-            model = ElasticNetCV(l1_ratio=list(cfg.enet_l1_ratios), cv=tscv,
-                                 max_iter=50000, n_jobs=-1,
-                                 random_state=cfg.random_state)
-            model.fit(Xtr_s, ytr.values)
-            point = float(model.predict(Xte_s)[0])
-            resid = ytr.values - model.predict(Xtr_s)
-            sigma = float(np.std(resid, ddof=1))
-            out = Prediction(point=point, sigma=sigma)
-            out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
-            order = np.argsort(-np.abs(model.coef_))
-            out.extra["coef_top"] = [
-                {"feature": top_cols[i], "coef": round(float(model.coef_[i]), 3)}
-                for i in order[:10] if model.coef_[i] != 0]
-            from scipy.stats import norm
-            for lv in cfg.interval_levels:
-                z = norm.ppf(0.5 + lv / 2)
-                out.lower[lv] = point - z * sigma
-                out.upper[lv] = point + z * sigma
-            return out
-        except Exception as e:
-            LOG.warning("MIDAS/ENet 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
 # ------------------------------------------------------------------------------
 # 8.3  LightGBM（分位数）+ 原生缺失
 # ------------------------------------------------------------------------------
@@ -924,56 +820,6 @@ class ModelLGB(BaseModel):
         except Exception as e:
             LOG.warning("LightGBM 在 %s 失败：%s", target_month.date(), e)
             return None
-
-
-# ------------------------------------------------------------------------------
-# 8.4  SARIMA 基准（带春节外生变量）
-# ------------------------------------------------------------------------------
-class ModelSARIMA(BaseModel):
-    """季节 ARIMA 基准：任何复杂模型必须显著优于它才有价值。带春节外生回归量。"""
-    name = "SARIMA"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from statsmodels.tsa.statespace.sarimax import SARIMAX
-        cfg = self.cfg
-        panel = ctx.aligner.build_monthly_panel(as_of)
-        y = panel["IVA_yoy"].dropna()
-        y = y.loc[:target_month]
-        if target_month in y.index:
-            y = y.drop(target_month)
-        if len(y) < cfg.backtest_min_train // 2:
-            return None
-        y = y.asfreq("ME")
-
-        # 外生：春节特征（训练区间 + 预测点）
-        idx_full = y.index.append(pd.DatetimeIndex([target_month]))
-        exog_all = spring_festival_features(idx_full)[["sf_in_jan", "sf_in_feb",
-                                                       "sf_offset_days", "month_1", "month_2"]]
-        exog_tr = exog_all.iloc[:-1]
-        exog_te = exog_all.iloc[[-1]]
-        try:
-            mod = SARIMAX(y, exog=exog_tr, order=(2, 0, 1),
-                          seasonal_order=(1, 0, 1, 12),
-                          enforce_stationarity=False, enforce_invertibility=False)
-            res = mod.fit(disp=False)
-            fc = res.get_forecast(steps=1, exog=exog_te)
-            point = float(fc.predicted_mean.iloc[0])
-            sigma = float(np.sqrt(fc.var_pred_mean.iloc[0]))
-            out = Prediction(point=point, sigma=sigma)
-            from scipy.stats import norm
-            for lv in cfg.interval_levels:
-                z = norm.ppf(0.5 + lv / 2)
-                out.lower[lv] = point - z * sigma
-                out.upper[lv] = point + z * sigma
-            return out
-        except Exception as e:
-            LOG.warning("SARIMA 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
 def _target_history(ctx, as_of, target_month, drop_janfeb=True):
     """取 as_of 可见的目标历史（到 T-1）。drop_janfeb=True 则剔除 1-2 月。"""
     panel = ctx.aligner.build_monthly_panel(as_of)
@@ -1040,7 +886,7 @@ def _nonjf_supervised_design(ctx, cfg, target_month, n_arlags=3,
         m = v.notna() & ytr.notna()
         if m.sum() >= 24 and v[m].std() > 1e-9:
             corr[c] = abs(np.corrcoef(v[m], ytr[m])[0, 1])
-    k = topk or cfg.midas_topk_features
+    k = topk or cfg.bridge_topk_features
     top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
                                 reverse=True)[:k]]
     design = pd.concat([feat.loc[nf_idx, top], lagdf], axis=1)
@@ -1143,6 +989,10 @@ class ModelARX(BaseModel):
             out = Prediction(point=point)
             _gauss_interval(out, point, sigma, cfg)
             out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
+            order = np.argsort(-np.abs(model.coef_))
+            out.extra["coef_top"] = [
+                {"feature": cols[i], "coef": round(float(model.coef_[i]), 3)}
+                for i in order[:10] if model.coef_[i] != 0]
             return out
         except Exception as e:
             LOG.warning("ARX 在 %s 失败：%s", target_month.date(), e)
@@ -1150,226 +1000,7 @@ class ModelARX(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# 8.4d  PLS（偏最小二乘桥接，成分数由时序CV选择，无泄漏）
-# ------------------------------------------------------------------------------
-class ModelPLS(BaseModel):
-    """PLS 桥接：对大量共线高频指标做偏最小二乘降维回归(含非1-2月 AR 滞后)。
-    成分数用 TimeSeriesSplit 选择(无泄漏)。1-2月退化为近期均值。"""
-    name = "PLS"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from sklearn.cross_decomposition import PLSRegression
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import TimeSeriesSplit
-        cfg = self.cfg
-        if target_month.month in (1, 2):
-            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
-            if ynf is None or len(ynf) < 6:
-                return None
-            point = float(ynf.tail(cfg.locallevel_k).mean())
-            out = Prediction(point=point)
-            _gauss_interval(out, point, float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
-            return out
-        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
-        if des is None:
-            return None
-        Xtr, ytr, Xte, cols, med = des
-        try:
-            sc = StandardScaler()
-            Xtr_s = sc.fit_transform(Xtr.values)
-            Xte_s = sc.transform(Xte.values)
-            y = ytr.values.astype(float)
-            # 成分数：用 TimeSeriesSplit 选 MSE 最小(无泄漏)
-            tscv = TimeSeriesSplit(5)
-            maxc = int(min(8, Xtr_s.shape[1], max(1, len(y) // 12)))
-            best_nc, best_mse = 1, np.inf
-            for nc in range(1, maxc + 1):
-                errs = []
-                for tr, va in tscv.split(Xtr_s):
-                    if len(tr) < 12 or len(va) < 1:
-                        continue
-                    pm = PLSRegression(n_components=nc)
-                    pm.fit(Xtr_s[tr], y[tr])
-                    pred = pm.predict(Xtr_s[va]).ravel()
-                    errs.append(np.mean((pred - y[va]) ** 2))
-                if errs and np.mean(errs) < best_mse:
-                    best_nc, best_mse = nc, np.mean(errs)
-            model = PLSRegression(n_components=best_nc)
-            model.fit(Xtr_s, y)
-            point = float(model.predict(Xte_s).ravel()[0])
-            sigma = float(np.std(y - model.predict(Xtr_s).ravel(), ddof=1))
-            out = Prediction(point=point)
-            _gauss_interval(out, point, sigma, cfg)
-            out.extra["n_components"] = int(best_nc)
-            return out
-        except Exception as e:
-            LOG.warning("PLS 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
-# ------------------------------------------------------------------------------
-# 8.5  ETS（阻尼指数平滑）——局部水平/趋势的统计正规版
-# ------------------------------------------------------------------------------
-class ModelETS(BaseModel):
-    """对【非1-2月】目标子序列做阻尼趋势指数平滑(Holt damped)。比粗糙 trailing-mean
-    更平滑地权衡近期信息；1-2月退化为近期均值。"""
-    name = "ETS"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from statsmodels.tsa.holtwinters import ExponentialSmoothing
-        cfg = self.cfg
-        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
-        if ynf is None or len(ynf) < 24:
-            return None
-        vals = ynf.values.astype(float)
-        try:
-            if target_month.month in (1, 2):
-                point = float(ynf.tail(cfg.locallevel_k).mean())
-                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
-            else:
-                res = ExponentialSmoothing(
-                    vals, trend="add", damped_trend=True,
-                    initialization_method="estimated").fit()
-                point = float(np.asarray(res.forecast(1))[0])
-                sigma = float(np.std(vals - res.fittedvalues, ddof=1))
-            out = Prediction(point=point)
-            _gauss_interval(out, point, sigma, cfg)
-            return out
-        except Exception as e:
-            LOG.warning("ETS 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
-# ------------------------------------------------------------------------------
-# 8.6  UCM（不可观测分量/结构时序）——状态空间局部水平，信号方差 MLE 自适应
-# ------------------------------------------------------------------------------
-class ModelUCM(BaseModel):
-    """对【非1-2月】子序列拟合 UnobservedComponents(局部水平)。若信号方差被估为≈0，
-    模型自动退化为常数均值(=最稳)；否则适度跟踪近期水平。1-2月退化为近期均值。"""
-    name = "UCM"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from statsmodels.tsa.statespace.structural import UnobservedComponents
-        cfg = self.cfg
-        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
-        if ynf is None or len(ynf) < 24:
-            return None
-        vals = ynf.values.astype(float)
-        try:
-            if target_month.month in (1, 2):
-                point = float(ynf.tail(cfg.locallevel_k).mean())
-                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
-            else:
-                res = UnobservedComponents(
-                    vals, level="local level").fit(disp=False, maxiter=200)
-                fc = res.get_forecast(1)
-                point = float(np.asarray(fc.predicted_mean)[0])
-                sigma = float(np.sqrt(np.asarray(fc.var_pred_mean)[0]))
-            out = Prediction(point=point)
-            _gauss_interval(out, point, sigma, cfg)
-            return out
-        except Exception as e:
-            LOG.warning("UCM 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
-# ------------------------------------------------------------------------------
-# 8.7  Anchor+HF（锚定近期水平 + 高频重收缩边际修正）
-# ------------------------------------------------------------------------------
-class ModelAnchoredCorrection(BaseModel):
-    """以"近期非1-2月均值"为锚，仅让高频做【重度收缩】的边际修正：
-        预测 = 锚 + clip( Ridge(高频特征 -> (目标-锚)残差) )。
-    直接检验"高频在水平之上是否还有增量价值"——比让高频模型单打独斗更公平、更强。
-    1-2月退化为锚本身。"""
-    name = "Anchor+HF"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from sklearn.linear_model import RidgeCV
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import TimeSeriesSplit
-        cfg = self.cfg
-        feat = ctx.realtime_feature_matrix()
-        if target_month not in feat.index:
-            return None
-        ytar = feat["__target__"]
-        nf_mask = ~feat.index.month.isin([1, 2])
-        ynf = ytar[nf_mask]
-        anchor = ynf.shift(1).rolling(cfg.locallevel_k, min_periods=3).mean()
-        anchor = anchor.reindex(feat.index).ffill()   # 1-2月用最近一期锚
-        anchor_T = anchor.loc[target_month]
-        if not np.isfinite(anchor_T):
-            return None
-        if target_month.month in (1, 2):
-            out = Prediction(point=float(anchor_T))
-            _gauss_interval(out, float(anchor_T),
-                            float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
-            return out
-
-        resid = ytar - anchor
-        train_idx = feat.index[(feat.index < target_month) & nf_mask
-                               & resid.notna() & anchor.notna()]
-        if len(train_idx) > cfg.max_train_months:
-            train_idx = train_idx[-cfg.max_train_months:]
-        if len(train_idx) < 30:
-            return None
-        test_row = feat.loc[target_month]
-        Xtr_raw = feat.loc[train_idx]
-        rtar = resid.loc[train_idx]
-        min_cov = max(24, len(train_idx) // 3)
-        cand = [c for c in feat.columns if c != "__target__"
-                and pd.notna(test_row[c]) and Xtr_raw[c].notna().sum() >= min_cov]
-        corr = {}
-        for c in cand:
-            v = Xtr_raw[c]
-            m = v.notna() & rtar.notna()
-            if m.sum() >= 24 and v[m].std() > 1e-9:
-                corr[c] = abs(np.corrcoef(v[m], rtar[m])[0, 1])
-        top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
-                                    reverse=True)[:cfg.midas_topk_features]]
-        if len(top) < 3:
-            out = Prediction(point=float(anchor_T))
-            _gauss_interval(out, float(anchor_T), float(rtar.std(ddof=1)), cfg)
-            return out
-        try:
-            med = Xtr_raw[top].median()
-            Xtr = Xtr_raw[top].fillna(med).fillna(0.0)
-            Xte = feat.loc[[target_month], top].fillna(med).fillna(0.0)
-            sc = StandardScaler()
-            Xtr_s = sc.fit_transform(Xtr.values)
-            Xte_s = sc.transform(Xte.values)
-            ytr = rtar.values
-            # 时序CV选 alpha(无泄漏)；默认 RidgeCV 用 GCV/LOO 会泄漏，故显式传 cv
-            n_splits = max(2, min(5, len(ytr) // 12))
-            ridge = RidgeCV(alphas=[1.0, 10.0, 100.0, 1000.0, 1e4],
-                            cv=TimeSeriesSplit(n_splits))
-            ridge.fit(Xtr_s, ytr)
-            corr_pred = float(np.clip(ridge.predict(Xte_s)[0], -2.0, 2.0))
-            point = float(anchor_T) + corr_pred
-            sigma = float(np.std(ytr - ridge.predict(Xtr_s), ddof=1))
-            out = Prediction(point=point)
-            _gauss_interval(out, point, sigma, cfg)
-            out.extra["anchor"] = round(float(anchor_T), 3)
-            out.extra["hf_correction"] = round(corr_pred, 3)
-            return out
-        except Exception as e:
-            LOG.warning("Anchor+HF 在 %s 失败：%s", target_month.date(), e)
-            return None
-
-
-# ------------------------------------------------------------------------------
-# 8.8  局部水平基准（必须被超越的零智商基准）
+# 8.8  局部水平基准（朴素地板/参照）
 # ------------------------------------------------------------------------------
 class ModelLocalLevel(BaseModel):
     """局部水平基准：预测 = 最近 K 个【非1-2月】已发布目标值的均值。
@@ -1430,7 +1061,7 @@ class Context:
         return self._panel_cache[as_of]
 
     def realtime_feature_matrix(self) -> pd.DataFrame:
-        """【真实时点(vintage)特征矩阵】——修复 LGB/MIDAS 训练与预测信息集不一致。
+        """【真实时点(vintage)特征矩阵】——修复 ARX/LGB 训练与预测信息集不一致。
 
         每一行 m 都用"在 m 月 asof_day_of_month 号能看到的数据"构造(panel@as_of_m)：
           - 当月 m 高频=残月(到约19日)、月度宏观当月值=未发布(NaN)；
@@ -1460,10 +1091,10 @@ class Context:
         return self._rt_feat
 
 
-# 让各模型经由 Context 拿到 aligner（DFM/SARIMA 直接用 ctx.aligner，但内部调用的是
+# 让各模型经由 Context 拿到 aligner（DFM/AR/LocalLevel 直接用 ctx.aligner，但内部调用的是
 # ctx.panel_asof 的缓存版本——这里把 aligner.build_monthly_panel 代理到缓存）。
 def _wire_context_cache(ctx: Context):
-    """把 aligner.build_monthly_panel 包一层缓存，使 DFM/SARIMA 也复用缓存面板。"""
+    """把 aligner.build_monthly_panel 包一层缓存，使 DFM/AR 等也复用缓存面板。"""
     raw_build = ctx.aligner.build_monthly_panel
 
     def cached(as_of):
@@ -1879,12 +1510,9 @@ class Reporter:
         except Exception as e:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
-        styles = {"DFM": ("#d62728", "-"), "MIDAS_ENet": ("#1f77b4", "--"),
-                  "LightGBM": ("#2ca02c", "-."), "SARIMA": ("#9467bd", ":"),
-                  "LocalLevel": ("#8c564b", "-"), "ETS": ("#17becf", "--"),
-                  "UCM": ("#bcbd22", "-."), "Anchor+HF": ("#e377c2", "--"),
-                  "AR": ("#000000", "-"), "ARX": ("#1f77b4", ":"),
-                  "PLS": ("#2ca02c", ":"), "ENSEMBLE": ("#ff7f0e", "-")}
+        styles = {"AR": ("#1f77b4", "-"), "LocalLevel": ("#8c564b", ":"),
+                  "ARX": ("#d62728", "--"), "DFM": ("#9467bd", "-."),
+                  "LightGBM": ("#2ca02c", "-."), "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
         ax = axes[0]
@@ -2009,7 +1637,7 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
     导致"主要驱动"与最终预测值无关。新版：
       - ensemble_composition：组合里每个模型的权重、点预测、加权贡献；
       - note：若由基准(LocalLevel)主导，明确说明"预测≈近期实际均值，高频无增量信号"；
-      - feature_drivers：仅来自【权重>0】且能给出特征解释的模型(LGB重要度 / MIDAS系数)。
+      - feature_drivers：仅来自【权重>0】且能给出特征解释的模型(LGB重要度 / ARX系数)。
     """
     out = {"ensemble_composition": [], "feature_drivers": [], "note": ""}
     if not weights:
@@ -2046,7 +1674,7 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
                 "model": name, "weight": round(float(w), 3),
                 "top_features": [{"feature": k, "gain_share": round(v / tot, 3)}
                                  for k, v in items]})
-        elif name == "MIDAS_ENet" and "coef_top" in pm.extra:
+        elif name == "ARX" and "coef_top" in pm.extra:
             out["feature_drivers"].append({
                 "model": name, "weight": round(float(w), 3),
                 "top_features": pm.extra["coef_top"]})
@@ -2082,19 +1710,18 @@ def main(cfg: Config = CFG):
     _wire_context_cache(ctx)
 
     # 3) 模型集合
+    # 核心模型：AR(基准) + LocalLevel(朴素地板) + ARX(锚定高频桥接)
     models = [
-        ModelAR(cfg),            # 基准：AR(p) BIC
-        ModelLocalLevel(cfg),    # 简单参考(近期均值)
-        ModelETS(cfg),           # 阻尼指数平滑
-        ModelUCM(cfg),           # 不可观测分量(局部水平)
-        ModelSARIMA(cfg),        # 季节 ARIMA
-        ModelARX(cfg),           # AR + 高频外生(ElasticNet, 时序CV)
-        ModelPLS(cfg),           # 偏最小二乘桥接(时序CV)
-        ModelMIDAS(cfg),         # ElasticNet 桥接
-        ModelAnchoredCorrection(cfg),  # 锚 + 高频重收缩修正(Ridge, 时序CV)
-        ModelDFM(cfg, indicators),     # 混频动态因子
-        ModelLGB(cfg),           # 梯度提升
+        ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
+        ModelLocalLevel(cfg),    # 朴素地板/参照（近期均值）
+        ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
     ]
+    # 探针模型（默认关闭）：机制最独特的高频/非线性模型，用于监测 regime 变化
+    if cfg.enable_probe_models:
+        models += [
+            ModelDFM(cfg, indicators),   # 混频动态因子（高频共同因子探针）
+            ModelLGB(cfg),               # 梯度提升（非线性探针）
+        ]
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）
