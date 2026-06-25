@@ -121,6 +121,13 @@ class Config:
     midas_use_isna_flags: bool = False  # 是否保留缺失指示列(默认关:它们多为噪声)
     ensemble_exclude_janfeb_in_weights: bool = True  # 组合权重按"剔除1-2月"误差计算
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
+
+    # ---- 基准与"是否真有技能"门控 ----
+    # 局部水平基准(近K个非1-2月目标均值)是必须被超越的零智商基准。
+    benchmark_name: str = "LocalLevel"
+    locallevel_k: int = 6                 # 局部水平用最近K个非1-2月观测
+    ensemble_keep_ratio: float = 1.02     # 仅保留 RMSE<=基准*该比值 的模型(基准本身恒保留)
+    dm_significance: float = 0.10         # DM检验显著性水平
     sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
 
     # ---- 模型 ----
@@ -957,6 +964,49 @@ class ModelSARIMA(BaseModel):
             return None
 
 
+# ------------------------------------------------------------------------------
+# 8.5  局部水平基准（必须被超越的零智商基准）
+# ------------------------------------------------------------------------------
+class ModelLocalLevel(BaseModel):
+    """局部水平基准：预测 = 最近 K 个【非1-2月】已发布目标值的均值。
+
+    回测证明这个"什么都不学"的基准击败了全部复杂模型——故把它正式纳入体系，
+    既作为组合的【锚】，也作为 DM 检验里所有复杂模型必须显著超越的对象。
+    对 1-2 月：退化为最近 K 个含 1-2 月的均值（1-2 月本不可预测，仅兜底）。
+    区间：近期波动的正态近似（最终由组合层共形校准）。
+    """
+    name = "LocalLevel"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        cfg = self.cfg
+        panel = ctx.aligner.build_monthly_panel(as_of)
+        y = panel["IVA_yoy"].dropna()
+        y = y.loc[:target_month]
+        if target_month in y.index:
+            y = y.drop(target_month)
+        if len(y) < 3:
+            return None
+        if target_month.month in (1, 2):
+            hist = y.tail(cfg.locallevel_k)
+        else:
+            hist = y[~y.index.month.isin([1, 2])].tail(cfg.locallevel_k)
+        if len(hist) == 0:
+            return None
+        point = float(hist.mean())
+        sigma = float(hist.std(ddof=1)) if len(hist) >= 2 else None
+        out = Prediction(point=point, sigma=sigma)
+        if sigma is not None and sigma > 0:
+            from scipy.stats import norm
+            for lv in cfg.interval_levels:
+                z = norm.ppf(0.5 + lv / 2)
+                out.lower[lv] = point - z * sigma
+                out.upper[lv] = point + z * sigma
+        return out
+
+
 # ==============================================================================
 # 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
 # ==============================================================================
@@ -1121,6 +1171,36 @@ def interval_metrics(y_true, lower, upper, nominal: float) -> dict:
             f"MPIW@{int(nominal*100)}": float(width)}
 
 
+def diebold_mariano(err_model: np.ndarray, err_bench: np.ndarray, h: int = 1):
+    """Diebold-Mariano 检验（平方损失，含 Harvey-Leybourne-Newbold 小样本修正）。
+
+    err_* 为各自的预测误差(pred-actual)。约定损失差 d = loss_model - loss_bench：
+      DM<0 且显著  -> 模型损失更低，【显著优于】基准；
+      DM>0 且显著  -> 模型【显著差于】基准；
+      不显著        -> 与基准无统计差异。
+    返回 (DM统计量, 双侧p值)。
+    """
+    from scipy.stats import t
+    e1, e2 = np.asarray(err_model, float), np.asarray(err_bench, float)
+    m = np.isfinite(e1) & np.isfinite(e2)
+    d = e1[m] ** 2 - e2[m] ** 2
+    n = len(d)
+    if n < 8:
+        return np.nan, np.nan
+    dbar = d.mean()
+    # h=1 时长程方差即样本方差；保留 NW 框架以便推广
+    gamma0 = np.var(d, ddof=0)
+    var_dbar = gamma0 / n
+    if var_dbar <= 0:
+        return np.nan, np.nan
+    dm = dbar / np.sqrt(var_dbar)
+    # HLN 小样本修正
+    corr = np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+    dm_hln = dm * corr
+    p = 2 * (1 - t.cdf(abs(dm_hln), df=n - 1))
+    return float(dm_hln), float(p)
+
+
 # ==============================================================================
 # 第 13 节  组合（逆误差加权）+ 分裂共形区间
 # ==============================================================================
@@ -1134,6 +1214,7 @@ class Ensemble:
         self.model_names = model_names
         self.weights: dict[str, float] = {}
         self.conformal_q: dict = {}   # {(level, group): half_width}
+        self.dm_results: dict = {}    # {model: (rmse, dm_stat, p_value)}
 
     def fit(self, bt: pd.DataFrame):
         cfg = self.cfg
@@ -1142,7 +1223,7 @@ class Ensemble:
         # 1) 计算各模型逆误差权重。默认按"剔除1-2月"误差计算——1-2月拆分值是不可预测
         #    的人造噪声，若计入会让权重被噪声主导、奖励到对噪声偶然拟合的模型。
         weight_mask_base = (~jf) if cfg.ensemble_exclude_janfeb_in_weights else np.ones_like(jf, bool)
-        rmses = {}
+        rmses, errs = {}, {}
         for name in self.model_names:
             col = f"{name}__point"
             if col not in bt:
@@ -1151,9 +1232,47 @@ class Ensemble:
             m = np.isfinite(y) & np.isfinite(p) & weight_mask_base
             if m.sum() >= 6:
                 rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
+                # 对齐的误差序列(剔1-2月、双方都有值)，供 DM 检验
+                errs[name] = pd.Series(p - y, index=bt.index).where(
+                    pd.Series(m, index=bt.index))
         if not rmses:
             raise RuntimeError("没有任何模型产生有效回测预测，无法组合。")
-        # 逆误差幂次加权：power=2 即逆MSE，更强地压制不稳定/高误差模型(如线性MIDAS)
+
+        # === 基准门控 + DM 检验：复杂模型必须"不显著差于"基准才进组合 ===
+        bench = cfg.benchmark_name
+        self.dm_results = {}
+        if bench in rmses:
+            bench_rmse = rmses[bench]
+            eb = errs[bench]
+            keep = [bench]  # 基准恒保留(锚)
+            for name in rmses:
+                if name == bench:
+                    continue
+                # 对齐两模型共同有效的月份
+                pair = pd.concat([errs[name], eb], axis=1).dropna()
+                dm, pval = (diebold_mariano(pair.iloc[:, 0].values,
+                                            pair.iloc[:, 1].values)
+                            if len(pair) >= 8 else (np.nan, np.nan))
+                self.dm_results[name] = (rmses[name], dm, pval)
+                # 保留条件：RMSE 不超过基准*keep_ratio（即"打得过或基本不输"）
+                if rmses[name] <= bench_rmse * cfg.ensemble_keep_ratio:
+                    keep.append(name)
+            dropped = [n for n in rmses if n not in keep]
+            LOG.info("基准=%s(RMSE=%.3f)；保留模型=%s；剔除(显著/明显差于基准)=%s",
+                     bench, bench_rmse, keep, dropped)
+            for name, (r, dm, pval) in self.dm_results.items():
+                verdict = ("显著优于基准" if (dm is not None and np.isfinite(dm) and dm < 0 and pval < cfg.dm_significance)
+                           else "显著差于基准" if (dm is not None and np.isfinite(dm) and dm > 0 and pval < cfg.dm_significance)
+                           else "与基准无显著差异")
+                LOG.info("  DM[%s vs %s]: RMSE=%.3f  DM=%s  p=%s  -> %s",
+                         name, bench, r,
+                         f"{dm:+.2f}" if np.isfinite(dm) else "NA",
+                         f"{pval:.3f}" if np.isfinite(pval) else "NA", verdict)
+            rmses = {k: v for k, v in rmses.items() if k in keep}
+        else:
+            LOG.warning("未找到基准模型 %s，退回为全模型逆MSE加权。", bench)
+
+        # 逆误差幂次加权（仅在通过门控的模型间）
         inv = {k: 1.0 / max(v, 1e-6) ** cfg.ensemble_weight_power
                for k, v in rmses.items()}
         ssum = sum(inv.values())
@@ -1473,6 +1592,7 @@ def main(cfg: Config = CFG):
 
     # 3) 模型集合
     models = [
+        ModelLocalLevel(cfg),   # 基准/锚：必须被复杂模型显著超越
         ModelDFM(cfg, indicators),
         ModelMIDAS(cfg),
         ModelLGB(cfg),
@@ -1493,6 +1613,20 @@ def main(cfg: Config = CFG):
     ev = reporter.evaluation_table(bt_full, model_names)
     LOG.info("\n===== 回测评估 =====\n%s", ev.round(3).to_string())
     reporter.plot_backtest(bt_full, model_names)
+
+    # DM 检验结果落盘（各复杂模型 vs 基准）
+    if ens.dm_results:
+        dm_rows = [{"model": k, "RMSE": round(v[0], 3),
+                    "DM_stat": (round(v[1], 3) if v[1] == v[1] else None),
+                    "p_value": (round(v[2], 3) if v[2] == v[2] else None),
+                    "verdict": ("显著优于基准" if (v[1]==v[1] and v[1] < 0 and v[2] < cfg.dm_significance)
+                                else "显著差于基准" if (v[1]==v[1] and v[1] > 0 and v[2] < cfg.dm_significance)
+                                else "与基准无显著差异"),
+                    "kept_in_ensemble": k in ens.weights}
+                   for k, v in ens.dm_results.items()]
+        pd.DataFrame(dm_rows).to_csv(
+            os.path.join(cfg.out_dir, "dm_test_vs_benchmark.csv"),
+            index=False, encoding="utf-8-sig")
 
     # 7) 实盘预测：下一个未发布月
     target_month = detect_target_month(raw, cfg)

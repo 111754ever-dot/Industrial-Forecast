@@ -1,11 +1,12 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 5.762,
-  "lower_80": 4.35,
-  "upper_80": 7.174,
-  "lower_95": 2.936,
-  "upper_95": 8.588,
+  "point_forecast": 5.2,
+  "lower_80": 4.017,
+  "upper_80": 6.383,
+  "lower_95": 2.8,
+  "upper_95": 7.6,
   "per_model": {
+    "LocalLevel": 5.2,
     "DFM": 6.388,
     "MIDAS_ENet": 7.083,
     "LightGBM": 6.284,
