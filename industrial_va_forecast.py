@@ -96,9 +96,11 @@ class Config:
     out_dir: str = "output"
 
     # ---- 真实时点口径 ----
-    # 预测月 T 的 as_of 评估时点 = T 月末 + asof_lag_days。
-    # 取 8 天：此时 T 的高频基本到齐，而 T 的工业增加值/月度宏观(发布滞后≈16天)尚未发布。
-    asof_lag_days: int = 8
+    # 业务口径：每月 20-25 号预测【当月(=下一个未发布月)】的工业增加值。
+    # 故预测月 T 的评估时点 as_of = T 当月的 asof_day_of_month 号（默认 23 号）。
+    # 此时：T 的高频已覆盖约 2/3 个月(残月)；T 的工业增加值/月度宏观(发布滞后≈16天)
+    # 尚未发布(只到 T-1)。与"伪真实时点回测"使用完全相同的规则。
+    asof_day_of_month: int = 23
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日）
     pub_lag_month_days: int = 16     # 月度宏观自变量发布滞后
     pub_lag_highfreq_days: int = 4   # 高频(日/周/旬)发布滞后
@@ -507,34 +509,36 @@ class FrequencyAligner:
     def _highfreq_monthly_yoy(self, vis: pd.Series) -> pd.Series:
         """高频水平量/价格 -> 月度【同口径(MTD)同比】。
 
-        关键修正：每个月的同比都用"该月已覆盖到的最大日(cap) ÷ 去年同月【同样 day<=cap
-        窗口】的均值"。完整月 cap≈月末，等价于整月同比；最新【残月】(如旬度只到5月10日)
-        则与去年同期同一日窗口对像比较，消除"残月均值 ÷ 去年整月均值"的口径偏差与噪声。
+        完整历史月用整月同比(向量化)；只有【最后一个(残)月】用 MTD 同口径同比
+        ——拿今年该月已覆盖到的最大日 day<=cap 窗口 ÷ 去年同月同一窗口，消除"残月均值÷
+        去年整月均值"的口径偏差。任一 vintage 面板里只有当月是残月，故仅需修正末月，O(月数)。
         """
         s = vis.copy()
         s.index = pd.DatetimeIndex(s.index)
         df = pd.DataFrame({"v": s.astype(float).values}, index=s.index)
         df["month"] = to_month_index(df.index)
         df["dom"] = df.index.day
-        monthly_mean = df.groupby("month")["v"].mean()
-        monthly_cap = df.groupby("month")["dom"].max()
-        month_set = set(monthly_mean.index)
-        out = {}
-        for m in monthly_mean.index:
-            prior = month_end(pd.Timestamp(m) - pd.DateOffset(years=1))
-            if prior not in month_set:
-                out[m] = np.nan
-                continue
-            cap = monthly_cap[m]
+        monthly_mean = df.groupby("month")["v"].mean().sort_index()
+        if len(monthly_mean) == 0:
+            return pd.Series(dtype=float)
+        # 完整月：整月同比(向量化)
+        full_idx = pd.date_range(monthly_mean.index.min(),
+                                 monthly_mean.index.max(), freq="ME")
+        mm = monthly_mean.reindex(full_idx)
+        yoy = (mm / mm.shift(12) - 1.0) * 100.0
+        # 末月若残缺(覆盖日<28)则改用 MTD 同口径同比
+        last = monthly_mean.index.max()
+        cap = int(df.loc[df["month"] == last, "dom"].max())
+        if cap < 28:
+            prior = month_end(pd.Timestamp(last) - pd.DateOffset(years=1))
             pm = df[(df["month"] == prior) & (df["dom"] <= cap)]["v"]
+            cur = df[(df["month"] == last) & (df["dom"] <= cap)]["v"]
             base = pm.mean()
-            if len(pm) == 0 or not np.isfinite(base) or abs(base) < 1e-12:
-                out[m] = np.nan
-                continue
-            out[m] = (monthly_mean[m] / base - 1.0) * 100.0
-        ser = pd.Series(out).sort_index()
-        ser = ser.replace([np.inf, -np.inf], np.nan)
-        return ser
+            if len(pm) > 0 and len(cur) > 0 and np.isfinite(base) and abs(base) > 1e-12:
+                yoy.loc[last] = (cur.mean() / base - 1.0) * 100.0
+            else:
+                yoy.loc[last] = np.nan
+        return yoy.replace([np.inf, -np.inf], np.nan)
 
     def build_monthly_panel(self, as_of: pd.Timestamp) -> pd.DataFrame:
         """构造 as_of 时点的月度面板（列=指标内部名，行=月末），含目标列。"""
@@ -578,7 +582,7 @@ def spring_festival_features(index: pd.DatetimeIndex) -> pd.DataFrame:
     特征：
       sf_in_jan / sf_in_feb : 当年春节是否落在 1/2 月（哑变量，仅 1、2 月行非零）
       sf_offset_days        : 春节日相对 2 月 1 日的偏移天数（错位强度，1、2 月行）
-      sf_days_in_month      : 当月含春节假期影响的天数近似（春节当月=1，邻月=0）
+      sf_this_month         : 当月是否为春节所在月（春节当月=1，否则=0）
       month_1 / month_2     : 1 月、2 月哑变量（拆分口径基数效应）
     """
     rows = []
@@ -611,7 +615,9 @@ class FeatureBuilder:
     def build(self, panel: pd.DataFrame, target_key: str = "IVA_yoy") -> pd.DataFrame:
         cfg = self.cfg
         feat = pd.DataFrame(index=panel.index)
-        y = panel[target_key]
+        # 目标列可能在很早的月份(目标尚不可见)缺失 -> 用全 NaN 兜底，避免 KeyError
+        y = panel[target_key] if target_key in panel.columns \
+            else pd.Series(np.nan, index=panel.index)
 
         # 预测变量列（除目标）
         pred_cols = [c for c in panel.columns if c != target_key]
@@ -787,7 +793,7 @@ class ModelMIDAS(BaseModel):
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import TimeSeriesSplit
         cfg = self.cfg
-        feat = ctx.features_asof(as_of)
+        feat = ctx.realtime_feature_matrix()  # 真实时点矩阵:训练/预测信息集一致
         if target_month not in feat.index:
             return None
 
@@ -838,6 +844,10 @@ class ModelMIDAS(BaseModel):
             sigma = float(np.std(resid, ddof=1))
             out = Prediction(point=point, sigma=sigma)
             out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
+            order = np.argsort(-np.abs(model.coef_))
+            out.extra["coef_top"] = [
+                {"feature": top_cols[i], "coef": round(float(model.coef_[i]), 3)}
+                for i in order[:10] if model.coef_[i] != 0]
             from scipy.stats import norm
             for lv in cfg.interval_levels:
                 z = norm.ppf(0.5 + lv / 2)
@@ -864,7 +874,7 @@ class ModelLGB(BaseModel):
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
         import lightgbm as lgb
         cfg = self.cfg
-        feat = ctx.features_asof(as_of)
+        feat = ctx.realtime_feature_matrix()  # 真实时点矩阵:训练/预测信息集一致
         if target_month not in feat.index:
             return None
         train = feat.loc[:target_month].iloc[:-1].dropna(subset=["__target__"])
@@ -1018,18 +1028,42 @@ class Context:
         self.aligner = aligner
         self.fb = fb
         self._panel_cache: dict[pd.Timestamp, pd.DataFrame] = {}
-        self._feat_cache: dict[pd.Timestamp, pd.DataFrame] = {}
+        self._rt_feat: Optional[pd.DataFrame] = None
 
     def panel_asof(self, as_of: pd.Timestamp) -> pd.DataFrame:
         if as_of not in self._panel_cache:
             self._panel_cache[as_of] = self.aligner.build_monthly_panel(as_of)
         return self._panel_cache[as_of]
 
-    def features_asof(self, as_of: pd.Timestamp) -> pd.DataFrame:
-        if as_of not in self._feat_cache:
-            panel = self.panel_asof(as_of)
-            self._feat_cache[as_of] = self.fb.build(panel)
-        return self._feat_cache[as_of]
+    def realtime_feature_matrix(self) -> pd.DataFrame:
+        """【真实时点(vintage)特征矩阵】——修复 LGB/MIDAS 训练与预测信息集不一致。
+
+        每一行 m 都用"在 m 月 asof_day_of_month 号能看到的数据"构造(panel@as_of_m)：
+          - 当月 m 高频=残月(到约19日)、月度宏观当月值=未发布(NaN)；
+          - 过去月份 m-1, m-2…=完整可见；目标滞后=已发布部分。
+        于是【训练行与预测行具有完全相同的可得性结构】，杜绝"训练用完整月、预测用残月"
+        的信息集不一致。该矩阵与"何时运行"无关(行 m 只依赖 m 自身的 as_of)，故全局构建
+        一次并缓存，回测各步与实盘共享、且天然无前视。
+        """
+        if self._rt_feat is not None:
+            return self._rt_feat
+        # 用一个很晚的 as_of 取到完整月份索引范围 + 已实现目标值
+        full = self.aligner.build_monthly_panel(pd.Timestamp("2100-01-01"))
+        months = [m for m in full.index]
+        rows = []
+        for m in months:
+            as_of_m = asof_for_target(self.cfg, m)
+            panel_m = self.panel_asof(as_of_m)
+            feat_m = self.fb.build(panel_m)
+            if m in feat_m.index:
+                rows.append(feat_m.loc[[m]])
+        rt = pd.concat(rows).sort_index()
+        # 关键：特征保持 vintage，但【标签 __target__ 必须用已实现的真实目标值】
+        # (vintage 行的当月目标未发布=NaN，不能当训练标签；其余 y 滞后特征仍是 vintage)
+        rt["__target__"] = full["IVA_yoy"].reindex(rt.index)
+        self._rt_feat = rt
+        LOG.info("已构建真实时点(vintage)特征矩阵：%s", rt.shape)
+        return self._rt_feat
 
 
 # 让各模型经由 Context 拿到 aligner（DFM/SARIMA 直接用 ctx.aligner，但内部调用的是
@@ -1053,12 +1087,14 @@ def _wire_context_cache(ctx: Context):
 # 第 10 节  真实时点工具：由"预测月"推出 as_of
 # ==============================================================================
 def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
-    """预测月 T 的评估时点 = T 月末 + asof_lag_days。
+    """预测月 T 的评估时点 = T 当月的 asof_day_of_month 号（默认 23 号）。
 
-    在该时点：高频(滞后≈4天)已基本覆盖 T；目标与月度宏观(滞后≈16天)对 T 尚不可见，
-    对 T-1 可见。与"每月20-25日预测下一个未发布月"一致，且训练/测试同口径。
+    对齐业务"每月20-25号预测当月"：此时 T 的高频已覆盖约 2/3 个月(残月)，目标与月度
+    宏观(滞后≈16天)对 T 尚不可见、对 T-1 可见。回测与实盘使用同一规则，杜绝前视偏差。
     """
-    return month_end(target_month) + pd.Timedelta(days=cfg.asof_lag_days)
+    tm = month_end(target_month)
+    day = min(cfg.asof_day_of_month, tm.day)
+    return pd.Timestamp(year=tm.year, month=tm.month, day=day)
 
 
 def true_target_value(raw: dict, cfg: Config, target_month: pd.Timestamp) -> Optional[float]:
@@ -1151,12 +1187,14 @@ def point_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     # 方向命中率（相对上月变化方向）
     if len(yt) >= 2:
         out["DA"] = float(np.mean(np.sign(np.diff(yt)) == np.sign(np.diff(yp))))
-    # MASE（相对季节朴素）
+    # MASE（相对季节朴素）：分子与分母必须在【同一样本】nm 上计算，否则不可比
     if y_naive is not None:
         nm = mask & np.isfinite(y_naive)
-        denom = np.mean(np.abs(y_true[nm] - y_naive[nm]))
-        if denom > 0:
-            out["MASE"] = float(np.mean(np.abs(err)) / denom)
+        if nm.sum() > 0:
+            num = np.mean(np.abs(y_pred[nm] - y_true[nm]))
+            denom = np.mean(np.abs(y_true[nm] - y_naive[nm]))
+            if denom > 0:
+                out["MASE"] = float(num / denom)
     return out
 
 
@@ -1223,6 +1261,9 @@ class Ensemble:
         # 1) 计算各模型逆误差权重。默认按"剔除1-2月"误差计算——1-2月拆分值是不可预测
         #    的人造噪声，若计入会让权重被噪声主导、奖励到对噪声偶然拟合的模型。
         weight_mask_base = (~jf) if cfg.ensemble_exclude_janfeb_in_weights else np.ones_like(jf, bool)
+        # 短窗口稳健：有效月数过少时放宽门槛，避免直接失败
+        n_eff = int((np.isfinite(y) & weight_mask_base).sum())
+        min_obs = min(6, max(3, n_eff))
         rmses, errs = {}, {}
         for name in self.model_names:
             col = f"{name}__point"
@@ -1230,13 +1271,23 @@ class Ensemble:
                 continue
             p = bt[col].values
             m = np.isfinite(y) & np.isfinite(p) & weight_mask_base
-            if m.sum() >= 6:
+            if m.sum() >= min_obs:
                 rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
                 # 对齐的误差序列(剔1-2月、双方都有值)，供 DM 检验
                 errs[name] = pd.Series(p - y, index=bt.index).where(
                     pd.Series(m, index=bt.index))
         if not rmses:
-            raise RuntimeError("没有任何模型产生有效回测预测，无法组合。")
+            # 兜底：回测样本极少 -> 退化为基准(若有)或所有可用模型等权（仍继续算共形）
+            LOG.warning("回测有效样本不足(n_eff=%d)，退化为基准/等权组合。", n_eff)
+            avail = [n for n in self.model_names if f"{n}__point" in bt
+                     and bt[f"{n}__point"].notna().any()]
+            if not avail:
+                raise RuntimeError("没有任何模型产生有效回测预测，无法组合。")
+            fallback = ([cfg.benchmark_name] if cfg.benchmark_name in avail else avail)
+            self.weights = {k: 1.0 / len(fallback) for k in fallback}
+            self.dm_results = {}
+            LOG.info("组合权重(兜底)：%s", self.weights)
+            return self._finalize_conformal(bt, cfg)
 
         # === 基准门控 + DM 检验：复杂模型必须"不显著差于"基准才进组合 ===
         bench = cfg.benchmark_name
@@ -1279,24 +1330,26 @@ class Ensemble:
         self.weights = {k: v / ssum for k, v in inv.items()}
         LOG.info("组合权重：%s", {k: round(v, 3) for k, v in self.weights.items()})
 
-        # 2) 组合点预测
-        ens = self.combine_points(bt)
-        bt = bt.copy()
-        bt["ENSEMBLE__point"] = ens
+        return self._finalize_conformal(bt, cfg)
 
-        # 3) 分裂共形：用组合残差的绝对值分位数作为半宽，1/2月与其他月分组
+    def _finalize_conformal(self, bt: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+        """组合点预测 + 分裂共形区间（1/2月与其他月分组校准）。"""
+        bt = bt.copy()
+        bt["ENSEMBLE__point"] = self.combine_points(bt)
         resid = (bt["ENSEMBLE__point"] - bt["y_true"]).abs().values
         grp = bt["is_jan_feb"].values
+        all_resid = resid[np.isfinite(resid)]
         for lv in cfg.interval_levels:
             for group, gmask in [("normal", ~grp), ("janfeb", grp)]:
                 r = resid[gmask & np.isfinite(resid)]
                 if len(r) >= 5:
-                    # 分裂共形分位数（有限样本校正）
-                    k = int(np.ceil((len(r) + 1) * lv))
+                    k = int(np.ceil((len(r) + 1) * lv))   # 分裂共形分位数(有限样本校正)
                     k = min(k, len(r))
                     q = np.sort(r)[k - 1]
+                elif len(all_resid) >= 1:
+                    q = float(np.nanquantile(all_resid, lv))  # 样本少时用全体残差兜底
                 else:
-                    q = np.nanquantile(resid[np.isfinite(resid)], lv) if np.isfinite(resid).any() else np.nan
+                    q = np.nan
                 self.conformal_q[(lv, group)] = float(q)
         LOG.info("共形半宽：%s", {f"{k[1]}@{int(k[0]*100)}": round(v, 2)
                                    for k, v in self.conformal_q.items()})
@@ -1551,15 +1604,56 @@ def sanity_clip(point: float, raw: dict, cfg: Config,
     return clipped, (abs(clipped - point) > 1e-6)
 
 
-def extract_drivers(per_model: dict, top_k: int = 12) -> list:
-    """从 LightGBM 特征重要度给出主要驱动因子（业务可解释）。"""
-    lgb_pred = per_model.get("LightGBM")
-    if lgb_pred is None or "importance" not in lgb_pred.extra:
-        return []
-    imp = lgb_pred.extra["importance"]
-    items = sorted(imp.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-    total = sum(v for _, v in items) or 1.0
-    return [{"feature": k, "gain_share": round(v / total, 3)} for k, v in items]
+def explain_drivers(per_model: dict, weights: dict, cfg: Config,
+                    top_k: int = 10) -> dict:
+    """【组合感知】的驱动解释：只解释【最终组合实际采用】的模型。
+
+    修复点：旧版恒取 LightGBM 特征重要度，但门控后组合可能根本没用 LightGBM，
+    导致"主要驱动"与最终预测值无关。新版：
+      - ensemble_composition：组合里每个模型的权重、点预测、加权贡献；
+      - note：若由基准(LocalLevel)主导，明确说明"预测≈近期实际均值，高频无增量信号"；
+      - feature_drivers：仅来自【权重>0】且能给出特征解释的模型(LGB重要度 / MIDAS系数)。
+    """
+    out = {"ensemble_composition": [], "feature_drivers": [], "note": ""}
+    if not weights:
+        return out
+    for name, w in sorted(weights.items(), key=lambda kv: -kv[1]):
+        pm = per_model.get(name)
+        if pm is None:
+            continue
+        out["ensemble_composition"].append({
+            "model": name, "weight": round(float(w), 3),
+            "point": round(float(pm.point), 3),
+            "weighted_contribution": round(float(w) * float(pm.point), 3)})
+
+    dom = max(weights, key=weights.get)
+    if dom == cfg.benchmark_name and per_model.get(cfg.benchmark_name) is not None:
+        ll = per_model[cfg.benchmark_name]
+        out["note"] = (
+            f"组合由基准 LocalLevel 主导(权重 {weights[dom]:.2f})：预测≈最近 "
+            f"{cfg.locallevel_k} 个非1-2月实际值的均值 = {ll.point:.2f}。"
+            f"即【主要驱动是近期工业增加值水平本身】，高频指标未提供超越基准的"
+            f"增量信号(见 DM 检验)。")
+
+    for name, w in weights.items():
+        if w <= 0:
+            continue
+        pm = per_model.get(name)
+        if pm is None:
+            continue
+        if name == "LightGBM" and "importance" in pm.extra:
+            items = sorted(pm.extra["importance"].items(),
+                           key=lambda kv: kv[1], reverse=True)[:top_k]
+            tot = sum(v for _, v in items) or 1.0
+            out["feature_drivers"].append({
+                "model": name, "weight": round(float(w), 3),
+                "top_features": [{"feature": k, "gain_share": round(v / tot, 3)}
+                                 for k, v in items]})
+        elif name == "MIDAS_ENet" and "coef_top" in pm.extra:
+            out["feature_drivers"].append({
+                "model": name, "weight": round(float(w), 3),
+                "top_features": pm.extra["coef_top"]})
+    return out
 
 
 # ==============================================================================
@@ -1652,7 +1746,7 @@ def main(cfg: Config = CFG):
         LOG.warning("极端值护栏触发：组合点预测 %.2f -> %.2f（限制在近12月范围±%.1f）",
                     point_raw, point, cfg.sanity_clip_pp)
     intervals = ens.interval_for(point, target_month)
-    drivers = extract_drivers(per_model)
+    drivers = explain_drivers(per_model, ens.weights, cfg)
 
     # 8) 落地产出
     reporter.save_data_quality(loader, ctx, as_of)

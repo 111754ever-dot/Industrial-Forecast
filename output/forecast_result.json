@@ -1,65 +1,27 @@
 {
   "target_month": "2026-05-31",
   "point_forecast": 5.2,
-  "lower_80": 4.017,
-  "upper_80": 6.383,
-  "lower_95": 2.8,
-  "upper_95": 7.6,
+  "lower_80": 3.417,
+  "upper_80": 6.983,
+  "lower_95": 2.267,
+  "upper_95": 8.133,
   "per_model": {
     "LocalLevel": 5.2,
-    "DFM": 6.388,
-    "MIDAS_ENet": 7.083,
-    "LightGBM": 6.284,
+    "DFM": 6.557,
+    "MIDAS_ENet": 6.621,
+    "LightGBM": 5.312,
     "SARIMA": 4.446
   },
-  "top_drivers": [
-    {
-      "feature": "house_sale_30_t0",
-      "gain_share": 0.226
-    },
-    {
-      "feature": "steel_rolled_key_t0",
-      "gain_share": 0.144
-    },
-    {
-      "feature": "port_cfd_t0",
-      "gain_share": 0.12
-    },
-    {
-      "feature": "pmi_newexport_t0",
-      "gain_share": 0.093
-    },
-    {
-      "feature": "prod_rebar_mill_t0",
-      "gain_share": 0.073
-    },
-    {
-      "feature": "power_yoy_t0",
-      "gain_share": 0.068
-    },
-    {
-      "feature": "port_qhd_t0",
-      "gain_share": 0.059
-    },
-    {
-      "feature": "util_rebar_mill_l1",
-      "gain_share": 0.05
-    },
-    {
-      "feature": "prod_power_equip_l2",
-      "gain_share": 0.043
-    },
-    {
-      "feature": "power_yoy_l1",
-      "gain_share": 0.042
-    },
-    {
-      "feature": "retail_yoy_l1",
-      "gain_share": 0.041
-    },
-    {
-      "feature": "util_pet_chip_t0",
-      "gain_share": 0.04
-    }
-  ]
+  "top_drivers": {
+    "ensemble_composition": [
+      {
+        "model": "LocalLevel",
+        "weight": 1.0,
+        "point": 5.2,
+        "weighted_contribution": 5.2
+      }
+    ],
+    "feature_drivers": [],
+    "note": "组合由基准 LocalLevel 主导(权重 1.00)：预测≈最近 6 个非1-2月实际值的均值 = 5.20。即【主要驱动是近期工业增加值水平本身】，高频指标未提供超越基准的增量信号(见 DM 检验)。"
+  }
 }

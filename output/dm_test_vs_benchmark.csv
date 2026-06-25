@@ -1,5 +1,5 @@
 ﻿model,RMSE,DM_stat,p_value,verdict,kept_in_ensemble
-DFM,1.268,1.153,0.259,与基准无显著差异,False
-MIDAS_ENet,3.224,4.59,0.0,显著差于基准,False
-LightGBM,1.757,2.52,0.018,显著差于基准,False
-SARIMA,1.386,1.917,0.065,显著差于基准,False
+DFM,1.729,0.984,0.331,与基准无显著差异,False
+MIDAS_ENet,2.476,3.371,0.002,显著差于基准,False
+LightGBM,1.747,1.403,0.168,与基准无显著差异,False
+SARIMA,1.626,1.036,0.307,与基准无显著差异,False
