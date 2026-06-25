@@ -1,45 +1,36 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.786,
-  "lower_80": 3.299,
-  "upper_80": 6.272,
-  "lower_95": 2.124,
-  "upper_95": 7.448,
+  "point_forecast": 4.354,
+  "lower_80": 2.734,
+  "upper_80": 5.973,
+  "lower_95": 2.07,
+  "upper_95": 6.638,
   "per_model": {
+    "AR": 4.757,
     "LocalLevel": 5.2,
     "ETS": 4.543,
     "UCM": 4.511,
     "SARIMA": 4.446,
-    "Anchor+HF": 4.911,
-    "DFM": 6.557,
+    "ARX": 3.972,
+    "PLS": 3.986,
     "MIDAS_ENet": 6.621,
+    "Anchor+HF": 4.706,
+    "DFM": 6.557,
     "LightGBM": 5.312
   },
   "top_drivers": {
     "ensemble_composition": [
       {
-        "model": "ETS",
-        "weight": 0.255,
-        "point": 4.543,
-        "weighted_contribution": 1.16
+        "model": "ARX",
+        "weight": 0.514,
+        "point": 3.972,
+        "weighted_contribution": 2.04
       },
       {
-        "model": "UCM",
-        "weight": 0.252,
-        "point": 4.511,
-        "weighted_contribution": 1.138
-      },
-      {
-        "model": "Anchor+HF",
-        "weight": 0.251,
-        "point": 4.911,
-        "weighted_contribution": 1.234
-      },
-      {
-        "model": "LocalLevel",
-        "weight": 0.241,
-        "point": 5.2,
-        "weighted_contribution": 1.253
+        "model": "AR",
+        "weight": 0.486,
+        "point": 4.757,
+        "weighted_contribution": 2.314
       }
     ],
     "feature_drivers": [],

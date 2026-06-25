@@ -125,8 +125,8 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 基准与"是否真有技能"门控 ----
-    # 局部水平基准(近K个非1-2月目标均值)是必须被超越的零智商基准。
-    benchmark_name: str = "LocalLevel"
+    # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
+    benchmark_name: str = "AR"
     locallevel_k: int = 6                 # 局部水平用最近K个非1-2月观测
     ensemble_keep_ratio: float = 1.02     # 仅保留 RMSE<=基准*该比值 的模型(基准本身恒保留)
     dm_significance: float = 0.10         # DM检验显著性水平
@@ -998,6 +998,218 @@ def _gauss_interval(out: Prediction, point, sigma, cfg):
             out.upper[lv] = point + z * sigma
 
 
+def _nonjf_supervised_design(ctx, cfg, target_month, n_arlags=3,
+                             include_arlags=True, topk=None):
+    """为【非1-2月】监督桥接模型(ARX/PLS)构造无泄漏设计矩阵。
+
+    要点：
+      - 仅用【非1-2月】行(避免1-2月人造噪声污染)；
+      - AR 滞后用【非1-2月子序列】的滞后(arlag1..p)，而非日历上月(后者对3月会取到2月噪声)；
+      - 高频特征：只取在预测点【可观测】且训练覆盖充分的列，按|相关|取 top-K(仅训练段算)；
+      - 排除日历 y_* 特征(可能含1-2月污染)，AR 信息统一由干净的 arlag 提供；
+      - 测试行缺失用【训练集】中位数填补。
+    返回 (Xtr, ytr, Xte, cols, med) 或 None。
+    """
+    feat = ctx.realtime_feature_matrix()
+    if target_month not in feat.index:
+        return None
+    nf_idx = feat.index[~feat.index.month.isin([1, 2])]
+    if target_month not in nf_idx:
+        return None
+    ytar = feat["__target__"]
+    ynf = ytar.loc[nf_idx]
+    lagdf = pd.DataFrame(index=nf_idx)
+    if include_arlags:
+        for L in range(1, n_arlags + 1):
+            lagdf[f"arlag{L}"] = ynf.shift(L)
+    hf_cols = [c for c in feat.columns
+               if c != "__target__" and not c.startswith("y_")]
+    test_row = feat.loc[target_month]
+    train_idx = nf_idx[(nf_idx < target_month) & ytar.loc[nf_idx].notna()]
+    if len(train_idx) > cfg.max_train_months:
+        train_idx = train_idx[-cfg.max_train_months:]
+    if len(train_idx) < 30:
+        return None
+    min_cov = max(24, len(train_idx) // 3)
+    ytr = ytar.loc[train_idx]
+    cand = [c for c in hf_cols if pd.notna(test_row[c])
+            and feat.loc[train_idx, c].notna().sum() >= min_cov]
+    corr = {}
+    for c in cand:
+        v = feat.loc[train_idx, c]
+        m = v.notna() & ytr.notna()
+        if m.sum() >= 24 and v[m].std() > 1e-9:
+            corr[c] = abs(np.corrcoef(v[m], ytr[m])[0, 1])
+    k = topk or cfg.midas_topk_features
+    top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                reverse=True)[:k]]
+    design = pd.concat([feat.loc[nf_idx, top], lagdf], axis=1)
+    Xtr_raw = design.loc[train_idx]
+    Xte_raw = design.loc[[target_month]]
+    # AR 滞后在预测点必须可得(否则该模型不适用)
+    if include_arlags and Xte_raw[list(lagdf.columns)].isna().any(axis=1).iloc[0]:
+        return None
+    if len(top) + len(lagdf.columns) < 3:
+        return None
+    med = Xtr_raw.median()
+    Xtr = Xtr_raw.fillna(med).fillna(0.0)
+    Xte = Xte_raw.fillna(med).fillna(0.0)
+    return Xtr, ytr, Xte, list(design.columns), med
+
+
+# ------------------------------------------------------------------------------
+# 8.4b  AR(p)（自回归，基准）——平稳自相关序列的标准技能下限
+# ------------------------------------------------------------------------------
+class ModelAR(BaseModel):
+    """对【非1-2月】目标子序列拟合 AR(p)，阶数由 BIC 选择(无CV、无泄漏)。
+
+    比"近期均值"更标准、更严格的基准：显式建模惯性/均值回复。
+    1-2月退化为近期均值。
+    """
+    name = "AR"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from statsmodels.tsa.ar_model import AutoReg, ar_select_order
+        cfg = self.cfg
+        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+        if ynf is None or len(ynf) < 30:
+            return None
+        vals = ynf.values.astype(float)
+        try:
+            if target_month.month in (1, 2):
+                point = float(ynf.tail(cfg.locallevel_k).mean())
+                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
+            else:
+                maxlag = int(min(12, max(1, len(vals) // 6)))
+                try:
+                    sel = ar_select_order(vals, maxlag=maxlag, ic="bic",
+                                          old_names=False)
+                    lags = sel.ar_lags if sel.ar_lags is not None and len(sel.ar_lags) else 1
+                except Exception:
+                    lags = 1
+                res = AutoReg(vals, lags=lags, old_names=False).fit()
+                point = float(np.asarray(res.predict(start=len(vals),
+                                                     end=len(vals)))[0])
+                sigma = float(np.sqrt(res.sigma2))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            return out
+        except Exception as e:
+            LOG.warning("AR 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4c  ARX（AR 滞后 + 高频外生，正则化 + 时序CV，无泄漏）
+# ------------------------------------------------------------------------------
+class ModelARX(BaseModel):
+    """ARX：非1-2月 AR 滞后 + 高频外生回归，ElasticNet 正则、TimeSeriesSplit 定参。
+    嵌套 AR(惯性锚)，公平检验高频在惯性之上的增量价值。1-2月退化为近期均值。"""
+    name = "ARX"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.linear_model import ElasticNetCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            point = float(ynf.tail(cfg.locallevel_k).mean())
+            out = Prediction(point=point)
+            _gauss_interval(out, point, float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
+            return out
+        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
+        if des is None:
+            return None
+        Xtr, ytr, Xte, cols, med = des
+        try:
+            sc = StandardScaler()
+            Xtr_s = sc.fit_transform(Xtr.values)
+            Xte_s = sc.transform(Xte.values)
+            model = ElasticNetCV(l1_ratio=list(cfg.enet_l1_ratios),
+                                 cv=TimeSeriesSplit(5), max_iter=50000,
+                                 n_jobs=-1, random_state=cfg.random_state)
+            model.fit(Xtr_s, ytr.values)
+            point = float(model.predict(Xte_s)[0])
+            sigma = float(np.std(ytr.values - model.predict(Xtr_s), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
+            return out
+        except Exception as e:
+            LOG.warning("ARX 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4d  PLS（偏最小二乘桥接，成分数由时序CV选择，无泄漏）
+# ------------------------------------------------------------------------------
+class ModelPLS(BaseModel):
+    """PLS 桥接：对大量共线高频指标做偏最小二乘降维回归(含非1-2月 AR 滞后)。
+    成分数用 TimeSeriesSplit 选择(无泄漏)。1-2月退化为近期均值。"""
+    name = "PLS"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.cross_decomposition import PLSRegression
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            point = float(ynf.tail(cfg.locallevel_k).mean())
+            out = Prediction(point=point)
+            _gauss_interval(out, point, float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
+            return out
+        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
+        if des is None:
+            return None
+        Xtr, ytr, Xte, cols, med = des
+        try:
+            sc = StandardScaler()
+            Xtr_s = sc.fit_transform(Xtr.values)
+            Xte_s = sc.transform(Xte.values)
+            y = ytr.values.astype(float)
+            # 成分数：用 TimeSeriesSplit 选 MSE 最小(无泄漏)
+            tscv = TimeSeriesSplit(5)
+            maxc = int(min(8, Xtr_s.shape[1], max(1, len(y) // 12)))
+            best_nc, best_mse = 1, np.inf
+            for nc in range(1, maxc + 1):
+                errs = []
+                for tr, va in tscv.split(Xtr_s):
+                    if len(tr) < 12 or len(va) < 1:
+                        continue
+                    pm = PLSRegression(n_components=nc)
+                    pm.fit(Xtr_s[tr], y[tr])
+                    pred = pm.predict(Xtr_s[va]).ravel()
+                    errs.append(np.mean((pred - y[va]) ** 2))
+                if errs and np.mean(errs) < best_mse:
+                    best_nc, best_mse = nc, np.mean(errs)
+            model = PLSRegression(n_components=best_nc)
+            model.fit(Xtr_s, y)
+            point = float(model.predict(Xte_s).ravel()[0])
+            sigma = float(np.std(y - model.predict(Xtr_s).ravel(), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["n_components"] = int(best_nc)
+            return out
+        except Exception as e:
+            LOG.warning("PLS 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
 # ------------------------------------------------------------------------------
 # 8.5  ETS（阻尼指数平滑）——局部水平/趋势的统计正规版
 # ------------------------------------------------------------------------------
@@ -1086,6 +1298,7 @@ class ModelAnchoredCorrection(BaseModel):
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
         from sklearn.linear_model import RidgeCV
         from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
         cfg = self.cfg
         feat = ctx.realtime_feature_matrix()
         if target_month not in feat.index:
@@ -1137,7 +1350,10 @@ class ModelAnchoredCorrection(BaseModel):
             Xtr_s = sc.fit_transform(Xtr.values)
             Xte_s = sc.transform(Xte.values)
             ytr = rtar.values
-            ridge = RidgeCV(alphas=[1.0, 10.0, 100.0, 1000.0, 1e4])
+            # 时序CV选 alpha(无泄漏)；默认 RidgeCV 用 GCV/LOO 会泄漏，故显式传 cv
+            n_splits = max(2, min(5, len(ytr) // 12))
+            ridge = RidgeCV(alphas=[1.0, 10.0, 100.0, 1000.0, 1e4],
+                            cv=TimeSeriesSplit(n_splits))
             ridge.fit(Xtr_s, ytr)
             corr_pred = float(np.clip(ridge.predict(Xte_s)[0], -2.0, 2.0))
             point = float(anchor_T) + corr_pred
@@ -1667,7 +1883,8 @@ class Reporter:
                   "LightGBM": ("#2ca02c", "-."), "SARIMA": ("#9467bd", ":"),
                   "LocalLevel": ("#8c564b", "-"), "ETS": ("#17becf", "--"),
                   "UCM": ("#bcbd22", "-."), "Anchor+HF": ("#e377c2", "--"),
-                  "ENSEMBLE": ("#ff7f0e", "-")}
+                  "AR": ("#000000", "-"), "ARX": ("#1f77b4", ":"),
+                  "PLS": ("#2ca02c", ":"), "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
         ax = axes[0]
@@ -1866,14 +2083,17 @@ def main(cfg: Config = CFG):
 
     # 3) 模型集合
     models = [
-        ModelLocalLevel(cfg),   # 基准/锚：必须被复杂模型显著超越
-        ModelETS(cfg),
-        ModelUCM(cfg),
-        ModelSARIMA(cfg),
-        ModelAnchoredCorrection(cfg),
-        ModelDFM(cfg, indicators),
-        ModelMIDAS(cfg),
-        ModelLGB(cfg),
+        ModelAR(cfg),            # 基准：AR(p) BIC
+        ModelLocalLevel(cfg),    # 简单参考(近期均值)
+        ModelETS(cfg),           # 阻尼指数平滑
+        ModelUCM(cfg),           # 不可观测分量(局部水平)
+        ModelSARIMA(cfg),        # 季节 ARIMA
+        ModelARX(cfg),           # AR + 高频外生(ElasticNet, 时序CV)
+        ModelPLS(cfg),           # 偏最小二乘桥接(时序CV)
+        ModelMIDAS(cfg),         # ElasticNet 桥接
+        ModelAnchoredCorrection(cfg),  # 锚 + 高频重收缩修正(Ridge, 时序CV)
+        ModelDFM(cfg, indicators),     # 混频动态因子
+        ModelLGB(cfg),           # 梯度提升
     ]
     model_names = [m.name for m in models]
 
