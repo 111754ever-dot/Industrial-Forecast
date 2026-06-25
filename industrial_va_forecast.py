@@ -120,6 +120,7 @@ class Config:
     midas_topk_features: int = 40    # MIDAS 入模前按|相关|预筛的特征数(降维抗过拟合)
     midas_use_isna_flags: bool = False  # 是否保留缺失指示列(默认关:它们多为噪声)
     ensemble_exclude_janfeb_in_weights: bool = True  # 组合权重按"剔除1-2月"误差计算
+    ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
     sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
 
     # ---- 模型 ----
@@ -496,6 +497,38 @@ class FrequencyAligner:
             return grouper.sum()
         raise ValueError(agg)
 
+    def _highfreq_monthly_yoy(self, vis: pd.Series) -> pd.Series:
+        """高频水平量/价格 -> 月度【同口径(MTD)同比】。
+
+        关键修正：每个月的同比都用"该月已覆盖到的最大日(cap) ÷ 去年同月【同样 day<=cap
+        窗口】的均值"。完整月 cap≈月末，等价于整月同比；最新【残月】(如旬度只到5月10日)
+        则与去年同期同一日窗口对像比较，消除"残月均值 ÷ 去年整月均值"的口径偏差与噪声。
+        """
+        s = vis.copy()
+        s.index = pd.DatetimeIndex(s.index)
+        df = pd.DataFrame({"v": s.astype(float).values}, index=s.index)
+        df["month"] = to_month_index(df.index)
+        df["dom"] = df.index.day
+        monthly_mean = df.groupby("month")["v"].mean()
+        monthly_cap = df.groupby("month")["dom"].max()
+        month_set = set(monthly_mean.index)
+        out = {}
+        for m in monthly_mean.index:
+            prior = month_end(pd.Timestamp(m) - pd.DateOffset(years=1))
+            if prior not in month_set:
+                out[m] = np.nan
+                continue
+            cap = monthly_cap[m]
+            pm = df[(df["month"] == prior) & (df["dom"] <= cap)]["v"]
+            base = pm.mean()
+            if len(pm) == 0 or not np.isfinite(base) or abs(base) < 1e-12:
+                out[m] = np.nan
+                continue
+            out[m] = (monthly_mean[m] / base - 1.0) * 100.0
+        ser = pd.Series(out).sort_index()
+        ser = ser.replace([np.inf, -np.inf], np.nan)
+        return ser
+
     def build_monthly_panel(self, as_of: pd.Timestamp) -> pd.DataFrame:
         """构造 as_of 时点的月度面板（列=指标内部名，行=月末），含目标列。"""
         cfg = self.cfg
@@ -508,15 +541,16 @@ class FrequencyAligner:
                 # 月度/目标：直接口径变换
                 ser = self.transformer.transform_monthly(vis, ind.transform)
             else:
-                # 高频：先聚合到月，再按口径做"月度同比/保持比率"
-                monthly = self._aggregate_highfreq_to_month(vis, ind.agg)
-                monthly.index = to_month_index(monthly.index)
-                monthly = monthly[~monthly.index.duplicated(keep="last")].sort_index()
+                # 高频：按口径做"月度同口径(MTD)同比 / 保持比率"
                 if ind.transform in ("level2yoy", "index2yoy"):
-                    full = pd.date_range(monthly.index.min(), monthly.index.max(), freq="ME")
-                    ser = safe_yoy(monthly.reindex(full))
+                    ser = self._highfreq_monthly_yoy(vis)  # 同口径(MTD)同比，消除残月偏差
+                    if ser.notna().any():
+                        full = pd.date_range(ser.index.min(), ser.index.max(), freq="ME")
+                        ser = ser.reindex(full)
                 elif ind.transform == "rate":
-                    ser = monthly
+                    monthly = self._aggregate_highfreq_to_month(vis, ind.agg)
+                    monthly.index = to_month_index(monthly.index)
+                    ser = monthly[~monthly.index.duplicated(keep="last")].sort_index()
                 else:
                     raise ValueError(f"高频指标 {ind.key} 不应是 transform={ind.transform}")
             cols[ind.key] = ser
@@ -1119,7 +1153,9 @@ class Ensemble:
                 rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
         if not rmses:
             raise RuntimeError("没有任何模型产生有效回测预测，无法组合。")
-        inv = {k: 1.0 / max(v, 1e-6) for k, v in rmses.items()}
+        # 逆误差幂次加权：power=2 即逆MSE，更强地压制不稳定/高误差模型(如线性MIDAS)
+        inv = {k: 1.0 / max(v, 1e-6) ** cfg.ensemble_weight_power
+               for k, v in rmses.items()}
         ssum = sum(inv.values())
         self.weights = {k: v / ssum for k, v in inv.items()}
         LOG.info("组合权重：%s", {k: round(v, 3) for k, v in self.weights.items()})
