@@ -1,5 +1,8 @@
 ﻿model,RMSE,DM_stat,p_value,verdict,kept_in_ensemble
+ETS,1.347,-0.22,0.827,与基准无显著差异,True
+UCM,1.355,-0.174,0.863,与基准无显著差异,True
+SARIMA,1.626,1.036,0.307,与基准无显著差异,False
+Anchor+HF,1.358,-0.153,0.879,与基准无显著差异,True
 DFM,1.729,0.984,0.331,与基准无显著差异,False
 MIDAS_ENet,2.476,3.371,0.002,显著差于基准,False
 LightGBM,1.747,1.403,0.168,与基准无显著差异,False
-SARIMA,1.626,1.036,0.307,与基准无显著差异,False

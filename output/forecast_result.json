@@ -1,27 +1,48 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 5.2,
-  "lower_80": 3.417,
-  "upper_80": 6.983,
-  "lower_95": 2.267,
-  "upper_95": 8.133,
+  "point_forecast": 4.786,
+  "lower_80": 3.299,
+  "upper_80": 6.272,
+  "lower_95": 2.124,
+  "upper_95": 7.448,
   "per_model": {
     "LocalLevel": 5.2,
+    "ETS": 4.543,
+    "UCM": 4.511,
+    "SARIMA": 4.446,
+    "Anchor+HF": 4.911,
     "DFM": 6.557,
     "MIDAS_ENet": 6.621,
-    "LightGBM": 5.312,
-    "SARIMA": 4.446
+    "LightGBM": 5.312
   },
   "top_drivers": {
     "ensemble_composition": [
       {
+        "model": "ETS",
+        "weight": 0.255,
+        "point": 4.543,
+        "weighted_contribution": 1.16
+      },
+      {
+        "model": "UCM",
+        "weight": 0.252,
+        "point": 4.511,
+        "weighted_contribution": 1.138
+      },
+      {
+        "model": "Anchor+HF",
+        "weight": 0.251,
+        "point": 4.911,
+        "weighted_contribution": 1.234
+      },
+      {
         "model": "LocalLevel",
-        "weight": 1.0,
+        "weight": 0.241,
         "point": 5.2,
-        "weighted_contribution": 5.2
+        "weighted_contribution": 1.253
       }
     ],
     "feature_drivers": [],
-    "note": "组合由基准 LocalLevel 主导(权重 1.00)：预测≈最近 6 个非1-2月实际值的均值 = 5.20。即【主要驱动是近期工业增加值水平本身】，高频指标未提供超越基准的增量信号(见 DM 检验)。"
+    "note": ""
   }
 }

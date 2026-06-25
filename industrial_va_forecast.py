@@ -974,8 +974,186 @@ class ModelSARIMA(BaseModel):
             return None
 
 
+def _target_history(ctx, as_of, target_month, drop_janfeb=True):
+    """取 as_of 可见的目标历史（到 T-1）。drop_janfeb=True 则剔除 1-2 月。"""
+    panel = ctx.aligner.build_monthly_panel(as_of)
+    if "IVA_yoy" not in panel.columns:
+        return None
+    y = panel["IVA_yoy"].dropna()
+    y = y.loc[:target_month]
+    if target_month in y.index:
+        y = y.drop(target_month)
+    if drop_janfeb:
+        y = y[~y.index.month.isin([1, 2])]
+    return y
+
+
+def _gauss_interval(out: Prediction, point, sigma, cfg):
+    from scipy.stats import norm
+    out.sigma = sigma
+    if sigma is not None and np.isfinite(sigma) and sigma > 0:
+        for lv in cfg.interval_levels:
+            z = norm.ppf(0.5 + lv / 2)
+            out.lower[lv] = point - z * sigma
+            out.upper[lv] = point + z * sigma
+
+
 # ------------------------------------------------------------------------------
-# 8.5  局部水平基准（必须被超越的零智商基准）
+# 8.5  ETS（阻尼指数平滑）——局部水平/趋势的统计正规版
+# ------------------------------------------------------------------------------
+class ModelETS(BaseModel):
+    """对【非1-2月】目标子序列做阻尼趋势指数平滑(Holt damped)。比粗糙 trailing-mean
+    更平滑地权衡近期信息；1-2月退化为近期均值。"""
+    name = "ETS"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+        cfg = self.cfg
+        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+        if ynf is None or len(ynf) < 24:
+            return None
+        vals = ynf.values.astype(float)
+        try:
+            if target_month.month in (1, 2):
+                point = float(ynf.tail(cfg.locallevel_k).mean())
+                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
+            else:
+                res = ExponentialSmoothing(
+                    vals, trend="add", damped_trend=True,
+                    initialization_method="estimated").fit()
+                point = float(np.asarray(res.forecast(1))[0])
+                sigma = float(np.std(vals - res.fittedvalues, ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            return out
+        except Exception as e:
+            LOG.warning("ETS 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.6  UCM（不可观测分量/结构时序）——状态空间局部水平，信号方差 MLE 自适应
+# ------------------------------------------------------------------------------
+class ModelUCM(BaseModel):
+    """对【非1-2月】子序列拟合 UnobservedComponents(局部水平)。若信号方差被估为≈0，
+    模型自动退化为常数均值(=最稳)；否则适度跟踪近期水平。1-2月退化为近期均值。"""
+    name = "UCM"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from statsmodels.tsa.statespace.structural import UnobservedComponents
+        cfg = self.cfg
+        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+        if ynf is None or len(ynf) < 24:
+            return None
+        vals = ynf.values.astype(float)
+        try:
+            if target_month.month in (1, 2):
+                point = float(ynf.tail(cfg.locallevel_k).mean())
+                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
+            else:
+                res = UnobservedComponents(
+                    vals, level="local level").fit(disp=False, maxiter=200)
+                fc = res.get_forecast(1)
+                point = float(np.asarray(fc.predicted_mean)[0])
+                sigma = float(np.sqrt(np.asarray(fc.var_pred_mean)[0]))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            return out
+        except Exception as e:
+            LOG.warning("UCM 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.7  Anchor+HF（锚定近期水平 + 高频重收缩边际修正）
+# ------------------------------------------------------------------------------
+class ModelAnchoredCorrection(BaseModel):
+    """以"近期非1-2月均值"为锚，仅让高频做【重度收缩】的边际修正：
+        预测 = 锚 + clip( Ridge(高频特征 -> (目标-锚)残差) )。
+    直接检验"高频在水平之上是否还有增量价值"——比让高频模型单打独斗更公平、更强。
+    1-2月退化为锚本身。"""
+    name = "Anchor+HF"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
+        cfg = self.cfg
+        feat = ctx.realtime_feature_matrix()
+        if target_month not in feat.index:
+            return None
+        ytar = feat["__target__"]
+        nf_mask = ~feat.index.month.isin([1, 2])
+        ynf = ytar[nf_mask]
+        anchor = ynf.shift(1).rolling(cfg.locallevel_k, min_periods=3).mean()
+        anchor = anchor.reindex(feat.index).ffill()   # 1-2月用最近一期锚
+        anchor_T = anchor.loc[target_month]
+        if not np.isfinite(anchor_T):
+            return None
+        if target_month.month in (1, 2):
+            out = Prediction(point=float(anchor_T))
+            _gauss_interval(out, float(anchor_T),
+                            float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
+            return out
+
+        resid = ytar - anchor
+        train_idx = feat.index[(feat.index < target_month) & nf_mask
+                               & resid.notna() & anchor.notna()]
+        if len(train_idx) > cfg.max_train_months:
+            train_idx = train_idx[-cfg.max_train_months:]
+        if len(train_idx) < 30:
+            return None
+        test_row = feat.loc[target_month]
+        Xtr_raw = feat.loc[train_idx]
+        rtar = resid.loc[train_idx]
+        min_cov = max(24, len(train_idx) // 3)
+        cand = [c for c in feat.columns if c != "__target__"
+                and pd.notna(test_row[c]) and Xtr_raw[c].notna().sum() >= min_cov]
+        corr = {}
+        for c in cand:
+            v = Xtr_raw[c]
+            m = v.notna() & rtar.notna()
+            if m.sum() >= 24 and v[m].std() > 1e-9:
+                corr[c] = abs(np.corrcoef(v[m], rtar[m])[0, 1])
+        top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                    reverse=True)[:cfg.midas_topk_features]]
+        if len(top) < 3:
+            out = Prediction(point=float(anchor_T))
+            _gauss_interval(out, float(anchor_T), float(rtar.std(ddof=1)), cfg)
+            return out
+        try:
+            med = Xtr_raw[top].median()
+            Xtr = Xtr_raw[top].fillna(med).fillna(0.0)
+            Xte = feat.loc[[target_month], top].fillna(med).fillna(0.0)
+            sc = StandardScaler()
+            Xtr_s = sc.fit_transform(Xtr.values)
+            Xte_s = sc.transform(Xte.values)
+            ytr = rtar.values
+            ridge = RidgeCV(alphas=[1.0, 10.0, 100.0, 1000.0, 1e4])
+            ridge.fit(Xtr_s, ytr)
+            corr_pred = float(np.clip(ridge.predict(Xte_s)[0], -2.0, 2.0))
+            point = float(anchor_T) + corr_pred
+            sigma = float(np.std(ytr - ridge.predict(Xtr_s), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["anchor"] = round(float(anchor_T), 3)
+            out.extra["hf_correction"] = round(corr_pred, 3)
+            return out
+        except Exception as e:
+            LOG.warning("Anchor+HF 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.8  局部水平基准（必须被超越的零智商基准）
 # ------------------------------------------------------------------------------
 class ModelLocalLevel(BaseModel):
     """局部水平基准：预测 = 最近 K 个【非1-2月】已发布目标值的均值。
@@ -1487,6 +1665,8 @@ class Reporter:
             return
         styles = {"DFM": ("#d62728", "-"), "MIDAS_ENet": ("#1f77b4", "--"),
                   "LightGBM": ("#2ca02c", "-."), "SARIMA": ("#9467bd", ":"),
+                  "LocalLevel": ("#8c564b", "-"), "ETS": ("#17becf", "--"),
+                  "UCM": ("#bcbd22", "-."), "Anchor+HF": ("#e377c2", "--"),
                   "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
@@ -1687,10 +1867,13 @@ def main(cfg: Config = CFG):
     # 3) 模型集合
     models = [
         ModelLocalLevel(cfg),   # 基准/锚：必须被复杂模型显著超越
+        ModelETS(cfg),
+        ModelUCM(cfg),
+        ModelSARIMA(cfg),
+        ModelAnchoredCorrection(cfg),
         ModelDFM(cfg, indicators),
         ModelMIDAS(cfg),
         ModelLGB(cfg),
-        ModelSARIMA(cfg),
     ]
     model_names = [m.name for m in models]
 
