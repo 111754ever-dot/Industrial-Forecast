@@ -1,78 +1,78 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.354,
-  "lower_80": 2.734,
-  "upper_80": 5.973,
-  "lower_95": 2.07,
-  "upper_95": 6.638,
+  "point_forecast": 4.44,
+  "lower_80": 2.674,
+  "upper_80": 6.205,
+  "lower_95": 2.211,
+  "upper_95": 6.668,
   "per_model": {
     "AR": 4.757,
     "LocalLevel": 5.2,
-    "ARX": 3.972
+    "ARX": 4.113
   },
   "top_drivers": {
     "ensemble_composition": [
       {
-        "model": "ARX",
-        "weight": 0.514,
-        "point": 3.972,
-        "weighted_contribution": 2.04
+        "model": "AR",
+        "weight": 0.507,
+        "point": 4.757,
+        "weighted_contribution": 2.412
       },
       {
-        "model": "AR",
-        "weight": 0.486,
-        "point": 4.757,
-        "weighted_contribution": 2.314
+        "model": "ARX",
+        "weight": 0.493,
+        "point": 4.113,
+        "weighted_contribution": 2.028
       }
     ],
     "feature_drivers": [
       {
         "model": "ARX",
-        "weight": 0.514,
+        "weight": 0.493,
         "top_features": [
           {
             "feature": "arlag3",
-            "coef": 0.787
+            "coef": 0.763
           },
           {
             "feature": "retail_yoy_l1",
-            "coef": 0.755
+            "coef": 0.714
           },
           {
             "feature": "arlag1",
-            "coef": 0.622
+            "coef": 0.619
           },
           {
             "feature": "reinv_cum_l1",
-            "coef": 0.413
-          },
-          {
-            "feature": "util_tire_semi_l2",
-            "coef": 0.381
+            "coef": 0.411
           },
           {
             "feature": "arlag2",
-            "coef": 0.362
+            "coef": 0.36
+          },
+          {
+            "feature": "util_tire_semi_l2",
+            "coef": 0.343
           },
           {
             "feature": "steel_crude_key_t0",
-            "coef": 0.337
+            "coef": 0.32
           },
           {
             "feature": "pmi_newexport_l2",
-            "coef": -0.24
+            "coef": -0.247
+          },
+          {
+            "feature": "port_cfd_t0",
+            "coef": 0.183
           },
           {
             "feature": "retail_yoy_l2",
-            "coef": -0.193
-          },
-          {
-            "feature": "land_area_100_l1",
-            "coef": 0.187
+            "coef": -0.18
           }
         ]
       }
     ],
-    "note": ""
+    "note": "组合由基准 LocalLevel 主导(权重 0.51)：预测≈最近 6 个非1-2月实际值的均值 = 4.76。即【主要驱动是近期工业增加值水平本身】，高频指标未提供超越基准的增量信号(见 DM 检验)。"
   }
 }

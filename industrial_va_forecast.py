@@ -97,15 +97,18 @@ class Config:
     # ---- 输出 ----
     out_dir: str = "output"
 
-    # ---- 真实时点口径 ----
-    # 业务口径：每月 20-25 号预测【当月(=下一个未发布月)】的工业增加值。
-    # 故预测月 T 的评估时点 as_of = T 当月的 asof_day_of_month 号（默认 23 号）。
-    # 此时：T 的高频已覆盖约 2/3 个月(残月)；T 的工业增加值/月度宏观(发布滞后≈16天)
-    # 尚未发布(只到 T-1)。与"伪真实时点回测"使用完全相同的规则。
-    asof_day_of_month: int = 23
-    pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日）
-    pub_lag_month_days: int = 16     # 月度宏观自变量发布滞后
-    pub_lag_highfreq_days: int = 4   # 高频(日/周/旬)发布滞后
+    # ---- 真实时点口径（预测时点不写死，按汇总表数据自动推断）----
+    # 业务：每月不固定的某天(大概率20-25号)收集最新汇总表后预测【下一个未发布月】。
+    # 预测时点 as_of 不固定为某号，而是【按汇总表自身的数据新鲜度自动确定】：
+    #   run_date = 各 sheet 最新观测日期的最大值(=实际采集日)；asof_day = run_date.day。
+    # 于是预测月T的 as_of = T 当月的 asof_day 号；因 T=采集当月，该 as_of 即 run_date 本身，
+    # 回测各历史月也用同一 asof_day，随采集时间自动平移、不写死。
+    # run_date / asof_day_of_month 为 None 时自动从数据推断；亦可显式覆盖。
+    run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
+    asof_day_of_month: Optional[int] = None  # None=自动取 run_date.day
+    pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
+    pub_lag_month_days: int = 16     # 月度宏观发布滞后（社零/投资 15-17日；PPI~9日；PMI月末）
+    pub_lag_highfreq_days: int = 4   # 高频发布滞后（日~1天/周~3-5天/旬~5天 的折中）
 
     # ---- 回测 ----
     backtest_months: int = 48        # 回测的外推月数（从最近往前）。生产可调大。
@@ -1111,14 +1114,35 @@ def _wire_context_cache(ctx: Context):
 # ==============================================================================
 # 第 10 节  真实时点工具：由"预测月"推出 as_of
 # ==============================================================================
-def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
-    """预测月 T 的评估时点 = T 当月的 asof_day_of_month 号（默认 23 号）。
+def infer_collection_date(raw: dict) -> pd.Timestamp:
+    """从汇总表推断采集日 = 各 sheet 最新观测日期的最大值(数据新鲜度)。"""
+    mx = None
+    for df in raw.values():
+        if "date" in df.columns and len(df):
+            d = pd.to_datetime(df["date"]).max()
+            mx = d if mx is None else max(mx, d)
+    return pd.Timestamp(mx)
 
-    对齐业务"每月20-25号预测当月"：此时 T 的高频已覆盖约 2/3 个月(残月)，目标与月度
-    宏观(滞后≈16天)对 T 尚不可见、对 T-1 可见。回测与实盘使用同一规则，杜绝前视偏差。
+
+def resolve_asof_day(cfg: Config, raw: dict) -> int:
+    """确定 as_of 的"当月第几天"：优先用 cfg 显式值，否则取采集日(run_date)的 day。"""
+    if cfg.asof_day_of_month is not None:
+        return int(cfg.asof_day_of_month)
+    run = pd.Timestamp(cfg.run_date) if cfg.run_date else infer_collection_date(raw)
+    return int(run.day)
+
+
+def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
+    """预测月 T 的评估时点 = T 当月的 asof_day 号。
+
+    asof_day 不写死：由 main() 在加载数据后调用 resolve_asof_day() 按【汇总表采集日】
+    自动确定并写回 cfg.asof_day_of_month，随采集时间自动平移。若未解析(独立调用)则回退 23。
+    业务含义：此时 T 的高频已覆盖约 2/3 个月(残月)，目标与月度宏观对 T 尚不可见、对 T-1
+    可见。回测与实盘使用同一规则，杜绝前视偏差。
     """
     tm = month_end(target_month)
-    day = min(cfg.asof_day_of_month, tm.day)
+    day = cfg.asof_day_of_month if cfg.asof_day_of_month is not None else 23
+    day = min(int(day), tm.day)
     return pd.Timestamp(year=tm.year, month=tm.month, day=day)
 
 
@@ -1702,6 +1726,12 @@ def main(cfg: Config = CFG):
     # 1) 读取 + 校验
     loader = DataLoader(cfg, indicators)
     raw = loader.load()
+
+    # 1b) 预测时点不写死：按汇总表采集日自动确定 as_of 的"当月第几天"
+    run_date = pd.Timestamp(cfg.run_date) if cfg.run_date else infer_collection_date(raw)
+    cfg.asof_day_of_month = resolve_asof_day(cfg, raw)
+    LOG.info("汇总表采集日(run_date)=%s -> as_of 取当月第 %d 天(随采集自动平移，未写死)",
+             run_date.date(), cfg.asof_day_of_month)
 
     # 2) 组装上下文
     aligner = FrequencyAligner(cfg, raw, indicators)
