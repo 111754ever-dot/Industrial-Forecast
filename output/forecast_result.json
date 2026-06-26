@@ -7,7 +7,6 @@
   "upper_95": 6.618,
   "per_model": {
     "AR": 4.757,
-    "LocalLevel": 5.2,
     "ARX": 4.021
   },
   "top_drivers": {

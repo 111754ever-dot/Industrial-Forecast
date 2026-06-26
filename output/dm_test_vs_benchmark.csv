@@ -1,3 +1,2 @@
 ﻿model,RMSE,DM_stat,p_value,verdict,kept_in_ensemble
-LocalLevel,1.386,0.766,0.448,与基准无显著差异,False
 ARX,1.27,0.152,0.88,与基准无显著差异,True

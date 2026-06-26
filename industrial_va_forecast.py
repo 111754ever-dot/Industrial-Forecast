@@ -18,12 +18,12 @@
   月内进度），杜绝前视偏差。
 * 样本长度不一致：**绝不截断到统一起止日期**（那样会被 2022 年才开始的指标拖到只剩
   3 年样本，丢掉 30 年历史）。改用：真实时点(vintage)对齐 + 各模型按能力处理缺失
-  （AR/LocalLevel 仅用目标自身；ARX 用"预测点可观测 + 训练覆盖充分"的高频，无需硬填）。
+  （AR 仅用目标自身；ARX 用"预测点可观测 + 训练覆盖充分"的高频，无需硬填）。
 * 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
 * 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
   conformal)校准"，保证经验覆盖达标且不过窄。
 * 模型集合（经 DM 检验严格筛选后定稿）：
-    - 核心(默认运行、进组合)：AR(p,基准/锚) + LocalLevel(朴素地板) + ARX(锚定高频桥接)；
+    - 核心(默认运行、进组合)：AR(p,基准/锚) + ARX(锚定高频桥接)；
     - 探针(默认关闭)：DFM + LightGBM，机制最独特的高频/非线性模型，仅用于监测"高频指标
       是否重新跑赢 AR"的 regime 信号，不参与默认预测。
   说明：经无泄漏回测 + Diebold-Mariano 检验证实，在"当月同比"与"累计同比"两种口径下，
@@ -132,7 +132,7 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 核心(默认运行、进DM门控组合): AR(基准) + LocalLevel(朴素地板) + ARX(锚定高频桥接)。
+    # 核心(默认运行、进DM门控组合): AR(基准) + ARX(锚定高频桥接)。
     # 探针(默认关闭): DFM/LightGBM——机制最独特的高频/非线性模型，平时不跑(慢)；开启后参与
     # DM 检验，用于监测"高频指标是否重新跑赢 AR"(regime 变化信号)，不影响默认预测。
     enable_probe_models: bool = False
@@ -140,7 +140,7 @@ class Config:
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
     benchmark_name: str = "AR"
-    locallevel_k: int = 6                 # 局部水平用最近K个非1-2月观测
+    janfeb_fallback_k: int = 6            # 1-2月兜底:用最近K个非1-2月观测均值
     ensemble_keep_ratio: float = 1.02     # 仅保留 RMSE<=基准*该比值 的模型(基准本身恒保留)
     dm_significance: float = 0.10         # DM检验显著性水平
     sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
@@ -950,8 +950,8 @@ class ModelAR(BaseModel):
         vals = ynf.values.astype(float)
         try:
             if target_month.month in (1, 2):
-                point = float(ynf.tail(cfg.locallevel_k).mean())
-                sigma = float(ynf.tail(cfg.locallevel_k).std(ddof=1))
+                point = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+                sigma = float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1))
             else:
                 maxlag = int(min(12, max(1, len(vals) // 6)))
                 try:
@@ -992,9 +992,9 @@ class ModelARX(BaseModel):
             ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
             if ynf is None or len(ynf) < 6:
                 return None
-            point = float(ynf.tail(cfg.locallevel_k).mean())
+            point = float(ynf.tail(cfg.janfeb_fallback_k).mean())
             out = Prediction(point=point)
-            _gauss_interval(out, point, float(ynf.tail(cfg.locallevel_k).std(ddof=1)), cfg)
+            _gauss_interval(out, point, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
             return out
         des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
         if des is None:
@@ -1021,51 +1021,6 @@ class ModelARX(BaseModel):
         except Exception as e:
             LOG.warning("ARX 在 %s 失败：%s", target_month.date(), e)
             return None
-
-
-# ------------------------------------------------------------------------------
-# 8.8  局部水平基准（朴素地板/参照）
-# ------------------------------------------------------------------------------
-class ModelLocalLevel(BaseModel):
-    """局部水平基准：预测 = 最近 K 个【非1-2月】已发布目标值的均值。
-
-    回测证明这个"什么都不学"的基准击败了全部复杂模型——故把它正式纳入体系，
-    既作为组合的【锚】，也作为 DM 检验里所有复杂模型必须显著超越的对象。
-    对 1-2 月：退化为最近 K 个含 1-2 月的均值（1-2 月本不可预测，仅兜底）。
-    区间：近期波动的正态近似（最终由组合层共形校准）。
-    """
-    name = "LocalLevel"
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        cfg = self.cfg
-        panel = ctx.aligner.build_monthly_panel(as_of)
-        y = panel["IVA_yoy"].dropna()
-        y = y.loc[:target_month]
-        if target_month in y.index:
-            y = y.drop(target_month)
-        if len(y) < 3:
-            return None
-        if target_month.month in (1, 2):
-            hist = y.tail(cfg.locallevel_k)
-        else:
-            hist = y[~y.index.month.isin([1, 2])].tail(cfg.locallevel_k)
-        if len(hist) == 0:
-            return None
-        point = float(hist.mean())
-        sigma = float(hist.std(ddof=1)) if len(hist) >= 2 else None
-        out = Prediction(point=point, sigma=sigma)
-        if sigma is not None and sigma > 0:
-            from scipy.stats import norm
-            for lv in cfg.interval_levels:
-                z = norm.ppf(0.5 + lv / 2)
-                out.lower[lv] = point - z * sigma
-                out.upper[lv] = point + z * sigma
-        return out
-
-
 # ==============================================================================
 # 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
 # ==============================================================================
@@ -1117,7 +1072,7 @@ class Context:
         return self._rt_feat
 
 
-# 让各模型经由 Context 拿到 aligner（DFM/AR/LocalLevel 直接用 ctx.aligner，但内部调用的是
+# 让各模型经由 Context 拿到 aligner（DFM/AR 直接用 ctx.aligner，但内部调用的是
 # ctx.panel_asof 的缓存版本——这里把 aligner.build_monthly_panel 代理到缓存）。
 def _wire_context_cache(ctx: Context):
     """把 aligner.build_monthly_panel 包一层缓存，使 DFM/AR 等也复用缓存面板。"""
@@ -1575,8 +1530,8 @@ class Reporter:
         except Exception as e:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
-        styles = {"AR": ("#1f77b4", "-"), "LocalLevel": ("#8c564b", ":"),
-                  "ARX": ("#d62728", "--"), "DFM": ("#9467bd", "-."),
+        styles = {"AR": ("#1f77b4", "-"), "ARX": ("#d62728", "--"),
+                  "DFM": ("#9467bd", "-."),
                   "LightGBM": ("#2ca02c", "-."), "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
@@ -1702,7 +1657,7 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
     修复点：旧版恒取 LightGBM 特征重要度，但门控后组合可能根本没用 LightGBM，
     导致"主要驱动"与最终预测值无关。新版：
       - ensemble_composition：组合里每个模型的权重、点预测、加权贡献；
-      - note：若由基准(LocalLevel)主导，明确说明"预测≈近期实际均值，高频无增量信号"；
+      - note：若由基准(AR)主导，明确说明"预测主要由目标自身惯性决定，高频无增量信号"；
       - feature_drivers：仅来自【权重>0】且能给出特征解释的模型(LGB重要度 / ARX系数)。
     """
     out = {"ensemble_composition": [], "feature_drivers": [], "note": ""}
@@ -1788,16 +1743,15 @@ def main(cfg: Config = CFG):
     ctx = Context(cfg, aligner, fb)
     _wire_context_cache(ctx)
 
-    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/LocalLevel/
+    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/
     #     DFM/ARX/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
     ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
         aligner, as_of_live, apply_pub_lag=False)
 
     # 3) 模型集合
-    # 核心模型：AR(基准) + LocalLevel(朴素地板) + ARX(锚定高频桥接)
+    # 核心模型：AR(基准) + ARX(锚定高频桥接)
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
-        ModelLocalLevel(cfg),    # 朴素地板/参照（近期均值）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
     ]
     # 探针模型（默认关闭）：机制最独特的高频/非线性模型，用于监测 regime 变化
