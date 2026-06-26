@@ -1,33 +1,40 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.394,
-  "lower_80": 2.598,
-  "upper_80": 6.19,
-  "lower_95": 2.17,
-  "upper_95": 6.618,
+  "point_forecast": 4.372,
+  "lower_80": 2.669,
+  "upper_80": 6.075,
+  "lower_95": 1.88,
+  "upper_95": 6.864,
   "per_model": {
     "AR": 4.757,
-    "ARX": 4.021
+    "ARX": 4.021,
+    "FA-AR": 4.325
   },
   "top_drivers": {
     "ensemble_composition": [
       {
         "model": "AR",
-        "weight": 0.507,
+        "weight": 0.345,
         "point": 4.757,
-        "weighted_contribution": 2.411
+        "weighted_contribution": 1.64
       },
       {
         "model": "ARX",
-        "weight": 0.493,
+        "weight": 0.336,
         "point": 4.021,
-        "weighted_contribution": 1.983
+        "weighted_contribution": 1.349
+      },
+      {
+        "model": "FA-AR",
+        "weight": 0.32,
+        "point": 4.325,
+        "weighted_contribution": 1.383
       }
     ],
     "feature_drivers": [
       {
         "model": "ARX",
-        "weight": 0.493,
+        "weight": 0.336,
         "top_features": [
           {
             "feature": "arlag3",
@@ -72,6 +79,6 @@
         ]
       }
     ],
-    "note": "组合由基准模型 AR 主导(权重 0.51，点预测 4.76)：预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频指标未提供超越基准的显著增量(见 DM 检验)。"
+    "note": "组合由 AR/ARX/FA-AR 构成(权重 AR=0.34, ARX=0.34, FA-AR=0.32)，三者均【锚定 AR 惯性】。预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正——经 DM 检验，高频对 AR 无显著增量。"
   }
 }

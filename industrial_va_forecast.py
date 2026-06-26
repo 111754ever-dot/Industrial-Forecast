@@ -22,12 +22,14 @@
 * 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
 * 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
   conformal)校准"，保证经验覆盖达标且不过窄。
-* 模型集合（经 DM 检验严格筛选后定稿）：
-    - 核心(默认运行、进组合)：AR(p,基准/锚) + ARX(锚定高频桥接)；
-    - 探针(默认关闭)：DFM + LightGBM，机制最独特的高频/非线性模型，仅用于监测"高频指标
-      是否重新跑赢 AR"的 regime 信号，不参与默认预测。
-  说明：经无泄漏回测 + Diebold-Mariano 检验证实，在"当月同比"与"累计同比"两种口径下，
-  高频指标均未显著超越 AR——故复杂高频模型降为探针，体系以"目标自身历史"为主。
+* 模型集合（三类机制各一，均【锚定 AR 惯性】以避免纯高频模型的系统性高估，提供方法学
+  多样性；门控按 Diebold-Mariano 检验"是否显著差于基准"决定进组合）：
+    - AR(p)        ：单变量自回归（基准/锚），BIC 定阶；
+    - ARX          ：AR 滞后 + 高频外生（弹性网, 时序CV），线性桥接；
+    - FA-AR        ：因子增广自回归 / 扩散指数（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson；
+    - LightGBM(可选)：锚定 + 梯度提升残差（非线性），回测显著差于AR，默认关，作交叉验证参考。
+  说明：经无泄漏回测 + DM 检验，在"当月同比/累计同比"口径下高频指标对 AR 无显著增量；故三个
+  核心模型都锚定 AR、仅让高频/因子作受限边际修正，彼此印证、机制互补。
 
 真实时点（ragged edge）口径
 --------------------------
@@ -132,9 +134,8 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 核心(默认运行、进DM门控组合): AR(基准) + ARX(锚定高频桥接)。
-    # 探针(默认关闭): DFM/LightGBM——机制最独特的高频/非线性模型，平时不跑(慢)；开启后参与
-    # DM 检验，用于监测"高频指标是否重新跑赢 AR"(regime 变化信号)，不影响默认预测。
+    # 核心(默认运行、进DM门控组合): AR + ARX + FA-AR（三类机制各一，均锚定AR）。
+    # 可选(默认关闭): LightGBM(锚定+GBM残差,非线性)——回测显著差于AR,开启后作交叉验证参考。
     enable_probe_models: bool = False
 
     # ---- 基准与"是否真有技能"门控 ----
@@ -697,94 +698,79 @@ class BaseModel:
 
 
 # ------------------------------------------------------------------------------
-# 8.1  MF-DFM（混频动态因子模型）
+# 8.1  FA-AR（因子增广自回归 / 扩散指数，Stock-Watson 2002）
 # ------------------------------------------------------------------------------
-class ModelDFM(BaseModel):
-    """statsmodels.DynamicFactorMQ：状态空间 + Kalman + EM，原生处理缺失/不等长/参差边缘。
-    分层：只用 dfm_tier=True 的"长且完整"指标，保证因子稳定。
-    区间：由 Kalman 预测方差给出高斯区间。
-    提速：每 dfm_refit_every 个月重估参数，其余月份复用参数仅做滤波/平滑。
-    """
-    name = "DFM"
+class ModelFAAR(BaseModel):
+    """因子增广自回归(FA-AR / 扩散指数)：非1-2月目标 ~ AR滞后 + 高频指标的【主成分因子(PCA)】，
+    岭回归(TimeSeriesSplit 定参，无泄漏)。
 
-    def __init__(self, cfg: Config, indicators: list[Indicator]):
+    设计要点（解决纯高频/原DFM"系统高估"的问题）：
+      - 【锚定 AR 惯性】：AR 滞后强制入模，高频因子仅作边际增量，故不会被高频带跑而高估；
+      - 【机制独特】：用 PCA 从高频面板提取共同因子（与 ARX 的弹性网选特征不同），提供方法
+        学多样性，是公认的 Stock-Watson 扩散指数预测法；
+      - 1-2月退化为近期均值。
+    """
+    name = "FA-AR"
+
+    def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.tier_keys = [i.key for i in indicators if i.dfm_tier]
-        self._cached_params = None
-        self._cached_month = None
 
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from statsmodels.tsa.statespace.dynamic_factor_mq import DynamicFactorMQ
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
         cfg = self.cfg
-        panel = ctx.aligner.build_monthly_panel(as_of)
-        cols = [c for c in self.tier_keys if c in panel.columns]
-        endog = panel[cols].copy()
-
-        # 截到 target_month（含），target_month 的目标值此时应为 NaN（未发布）
-        endog = endog.loc[:target_month]
-        if target_month not in endog.index:
-            endog.loc[target_month] = np.nan
-            endog = endog.sort_index()
-
-        # 丢弃整列全空、以及在该时点观测过少的列
-        min_obs = 36
-        keep = [c for c in endog.columns if endog[c].notna().sum() >= min_obs]
-        endog = endog[keep]
-        if "IVA_yoy" not in endog.columns:
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            p = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
+        if des is None:
             return None
-
-        # 设月度频率（statsmodels 需要明确频率）
-        endog = endog.asfreq("ME")
-
+        Xtr, ytr, Xte, cols, med = des
+        arl = [c for c in cols if c.startswith("arlag")]
+        hf = [c for c in cols if not c.startswith("arlag")]
+        if not arl:
+            return None
         try:
-            model = DynamicFactorMQ(
-                endog,
-                factors=cfg.dfm_factors,
-                factor_orders=cfg.dfm_factor_order,
-                idiosyncratic_ar1=True,
-                standardize=True,
-            )
-            refit = (self._cached_params is None or
-                     self._cached_month is None or
-                     (target_month.to_period("M") - self._cached_month.to_period("M")).n
-                     >= cfg.dfm_refit_every)
-            if refit:
-                res = model.fit(maxiter=cfg.dfm_maxiter, disp=False)
-                self._cached_params = res.params
-                self._cached_month = target_month
+            if len(hf) >= 3:
+                sc = StandardScaler()
+                Ztr = sc.fit_transform(Xtr[hf].values); Zte = sc.transform(Xte[hf].values)
+                r = int(min(cfg.dfm_factors, Ztr.shape[1], max(1, len(ytr) // 20)))
+                pca = PCA(n_components=r)
+                Ftr = pca.fit_transform(Ztr); Fte = pca.transform(Zte)
+                Dtr = np.hstack([Xtr[arl].values, Ftr]); Dte = np.hstack([Xte[arl].values, Fte])
             else:
-                try:
-                    res = model.smooth(self._cached_params)
-                except Exception:
-                    res = model.fit(maxiter=cfg.dfm_maxiter, disp=False)
-                    self._cached_params = res.params
-                    self._cached_month = target_month
-
-            # 目标在 target_month 的平滑/预测值与区间
-            pred = res.get_prediction(start=target_month, end=target_month)
-            mean = float(pred.predicted_mean["IVA_yoy"].iloc[0])
-            out = Prediction(point=mean)
-            # 用 Kalman 给出的 conf_int 作为 DFM 自带区间（最终以组合层共形为准）
-            for lv in cfg.interval_levels:
-                try:
-                    ci = pred.conf_int(alpha=1 - lv)
-                    lo = float(ci.filter(like="lower").filter(like="IVA_yoy").iloc[0, 0])
-                    hi = float(ci.filter(like="upper").filter(like="IVA_yoy").iloc[0, 0])
-                    out.lower[lv], out.upper[lv] = lo, hi
-                    if out.sigma is None and lv == 0.95:
-                        out.sigma = (hi - lo) / (2 * 1.959963985)
-                except Exception:
-                    pass
+                Dtr = Xtr[arl].values; Dte = Xte[arl].values
+            sc2 = StandardScaler()
+            Dtr_s = sc2.fit_transform(Dtr); Dte_s = sc2.transform(Dte)
+            ns = max(2, min(5, len(ytr) // 12))
+            ridge = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0, 1000.0], cv=TimeSeriesSplit(ns))
+            ridge.fit(Dtr_s, ytr.values)
+            point = float(ridge.predict(Dte_s)[0])
+            sigma = float(np.std(ytr.values - ridge.predict(Dtr_s), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
             return out
         except Exception as e:
-            LOG.warning("DFM 在 %s 失败：%s", target_month.date(), e)
+            LOG.warning("FA-AR 在 %s 失败：%s", target_month.date(), e)
             return None
 # ------------------------------------------------------------------------------
-# 8.3  LightGBM（分位数）+ 原生缺失
+# 8.3  LightGBM（锚定 + 梯度提升残差，非线性混合）
 # ------------------------------------------------------------------------------
 class ModelLGB(BaseModel):
-    """梯度提升：原生处理缺失、捕捉非线性，吸收很新/很稀疏的指标（如 2022 起的煤耗）。
-    区间：分位数回归（pinball loss）直接给出分位数；中位数作为点预测的备选。
+    """锚定 + 梯度提升残差：以"近期非1-2月均值"为锚，对【目标 − 锚】的残差用 LightGBM 做
+    受限非线性修正（修正幅度截断在 ±2pp）。
+
+    设计要点（解决纯 ML"系统高估"的问题）：
+      - 【锚定近期水平】：基线是近期实际均值，GBM 只解释残差，故不会被高频/基数带跑而高估；
+      - 【非线性机制】：GBM 原生处理缺失、捕捉非线性/交互，提供 AR/线性模型之外的方法学多样性；
+      - 1-2月退化为锚。
     """
     name = "LightGBM"
 
@@ -797,49 +783,44 @@ class ModelLGB(BaseModel):
         feat = ctx.realtime_feature_matrix()  # 真实时点矩阵:训练/预测信息集一致
         if target_month not in feat.index:
             return None
-        train = feat.loc[:target_month].iloc[:-1].dropna(subset=["__target__"])
-        # 抗过拟合：限定训练窗口
-        if len(train) > cfg.max_train_months:
-            train = train.iloc[-cfg.max_train_months:]
-        if len(train) < cfg.backtest_min_train // 2:
+        nf = ~feat.index.month.isin([1, 2])
+        ytar = feat["__target__"]; ynf = ytar[nf]
+        anchor = ynf.shift(1).rolling(cfg.janfeb_fallback_k, min_periods=3).mean()
+        anchor = anchor.reindex(feat.index).ffill()
+        aT = anchor.loc[target_month]
+        if not np.isfinite(aT):
             return None
-
-        Xtr = train.drop(columns="__target__")
-        ytr = train["__target__"]
-        Xte = feat.loc[[target_month]].drop(columns="__target__")
-
-        # 抗过拟合：大幅加正则——更浅的树、更少叶子、更高最小样本、更强 L1/L2、
-        # 列/行下采样、最小分裂增益门槛，并限制 n_estimators。
-        params_common = dict(
-            n_estimators=250, learning_rate=0.03, num_leaves=8, max_depth=3,
-            min_child_samples=30, min_split_gain=0.02,
-            subsample=0.7, subsample_freq=1, colsample_bytree=0.5,
-            reg_lambda=5.0, reg_alpha=2.0,
+        if target_month.month in (1, 2):
+            out = Prediction(point=float(aT))
+            _gauss_interval(out, float(aT), float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        # 残差 = 目标 − 锚（仅非1-2月）；高频特征对残差做受限非线性修正
+        resid = ytar - anchor
+        tr = feat.index[nf & (feat.index < target_month) & resid.notna() & anchor.notna()]
+        if len(tr) > cfg.max_train_months:
+            tr = tr[-cfg.max_train_months:]
+        if len(tr) < cfg.backtest_min_train // 2:
+            return None
+        hf = [c for c in feat.columns if c != "__target__" and not c.startswith("y_")]
+        Xtr = feat.loc[tr, hf]; ytr = resid.loc[tr]; Xte = feat.loc[[target_month], hf]
+        params = dict(
+            n_estimators=200, learning_rate=0.03, num_leaves=8, max_depth=3,
+            min_child_samples=30, min_split_gain=0.02, subsample=0.7, subsample_freq=1,
+            colsample_bytree=0.5, reg_lambda=5.0, reg_alpha=2.0,
             random_state=cfg.random_state, n_jobs=-1, verbose=-1,
         )
         try:
-            preds = {}
-            for q in cfg.lgb_quantiles:
-                m = lgb.LGBMRegressor(objective="quantile", alpha=q, **params_common)
-                m.fit(Xtr.values, ytr.values)
-                preds[q] = float(m.predict(Xte.values)[0])
-            # 点预测：用专门的 L2 目标更稳
-            m_mean = lgb.LGBMRegressor(objective="regression", **params_common)
-            m_mean.fit(Xtr.values, ytr.values)
-            point = float(m_mean.predict(Xte.values)[0])
-
+            m = lgb.LGBMRegressor(objective="regression", **params)
+            m.fit(Xtr.values, ytr.values)
+            corr = float(np.clip(m.predict(Xte.values)[0], -2.0, 2.0))  # 受限残差修正
+            point = float(aT) + corr
+            sigma = float(np.std(ytr.values - m.predict(Xtr.values), ddof=1))
             out = Prediction(point=point)
-            # 由分位数拼出 80/95 区间（保证单调）
-            qs = sorted(preds.items())
-            qvals = np.array([v for _, v in qs])
-            qvals = np.maximum.accumulate(qvals)  # 强制单调
-            qmap = {k: v for (k, _), v in zip(qs, qvals)}
-            out.lower[0.95] = qmap.get(0.025, point)
-            out.upper[0.95] = qmap.get(0.975, point)
-            out.lower[0.80] = qmap.get(0.10, point)
-            out.upper[0.80] = qmap.get(0.90, point)
+            _gauss_interval(out, point, sigma, cfg)
             out.extra["importance"] = dict(
-                zip(Xtr.columns, m_mean.booster_.feature_importance(importance_type="gain")))
+                zip(hf, m.booster_.feature_importance(importance_type="gain")))
+            out.extra["anchor"] = round(float(aT), 3)
+            out.extra["nl_correction"] = round(corr, 3)
             return out
         except Exception as e:
             LOG.warning("LightGBM 在 %s 失败：%s", target_month.date(), e)
@@ -1350,8 +1331,11 @@ class Ensemble:
                                             pair.iloc[:, 1].values)
                             if len(pair) >= 8 else (np.nan, np.nan))
                 self.dm_results[name] = (rmses[name], dm, pval)
-                # 保留条件：RMSE 不超过基准*keep_ratio（即"打得过或基本不输"）
-                if rmses[name] <= bench_rmse * cfg.ensemble_keep_ratio:
+                # 保留条件：RMSE 不超过基准*keep_ratio，【或】DM 检验显示"不显著差于基准"
+                # (统计上与基准等好的模型纳入组合，获取多样化收益；仅剔除显著更差者)。
+                dm_not_worse = (np.isfinite(dm)
+                                and not (dm > 0 and pval < cfg.dm_significance))
+                if rmses[name] <= bench_rmse * cfg.ensemble_keep_ratio or dm_not_worse:
                     keep.append(name)
             dropped = [n for n in rmses if n not in keep]
             LOG.info("基准=%s(RMSE=%.3f)；保留模型=%s；剔除(显著/明显差于基准)=%s",
@@ -1531,7 +1515,7 @@ class Reporter:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
         styles = {"AR": ("#1f77b4", "-"), "ARX": ("#d62728", "--"),
-                  "DFM": ("#9467bd", "-."),
+                  "FA-AR": ("#9467bd", "-."),
                   "LightGBM": ("#2ca02c", "-."), "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
@@ -1672,13 +1656,13 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
             "point": round(float(pm.point), 3),
             "weighted_contribution": round(float(w) * float(pm.point), 3)})
 
-    dom = max(weights, key=weights.get)
-    dompm = per_model.get(dom)
-    if dom == cfg.benchmark_name and dompm is not None:
+    # 三个核心模型(AR/ARX/FA-AR)均锚定 AR 惯性，故预测主要由自身历史惯性决定
+    if cfg.benchmark_name in weights:
         out["note"] = (
-            f"组合由基准模型 {dom} 主导(权重 {weights[dom]:.2f}，点预测 {dompm.point:.2f})："
-            f"预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，"
-            f"高频指标未提供超越基准的显著增量(见 DM 检验)。")
+            f"组合由 {('/'.join(weights.keys()))} 构成(权重 "
+            f"{', '.join('%s=%.2f' % (k, v) for k, v in weights.items())})，三者均【锚定 AR 惯性】。"
+            f"预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的"
+            f"边际修正——经 DM 检验，高频对 AR 无显著增量。")
 
     for name, w in weights.items():
         if w <= 0:
@@ -1748,18 +1732,17 @@ def main(cfg: Config = CFG):
     ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
         aligner, as_of_live, apply_pub_lag=False)
 
-    # 3) 模型集合
-    # 核心模型：AR(基准) + ARX(锚定高频桥接)
+    # 3) 模型集合 —— 三类机制各一，均锚定 AR 惯性、避免高频高估，提供方法学多样性：
+    #    AR(单变量惯性) + ARX(线性高频桥接) + FA-AR(因子增广/扩散指数)。门控按"是否显著差于
+    #    基准"决定进组合。
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
+        ModelFAAR(cfg),          # 因子增广AR / 扩散指数（AR滞后 + 高频PCA因子, 岭回归）
     ]
-    # 探针模型（默认关闭）：机制最独特的高频/非线性模型，用于监测 regime 变化
+    # 可选交叉验证模型（默认关闭）：非线性混合（锚定+GBM残差），回测显著差于AR，作参考。
     if cfg.enable_probe_models:
-        models += [
-            ModelDFM(cfg, indicators),   # 混频动态因子（高频共同因子探针）
-            ModelLGB(cfg),               # 梯度提升（非线性探针）
-        ]
+        models += [ModelLGB(cfg)]    # 锚定 + 梯度提升残差（非线性）
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）
