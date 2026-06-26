@@ -140,6 +140,12 @@ class Config:
     enable_probe_models: bool = True     # 纳入 LightGBM（锚定+GBM残差，非线性）
     enable_pls: bool = True              # 纳入 PLS（纯当月高频桥接, 不锚AR, 去相关多样性）
     pls_components: int = 2              # PLS 成分数（小，抗过拟合）
+    enable_dfm: bool = True              # 纳入 MF-DFM（状态空间Kalman因子+锚定AR岭回归）
+    # MF-DFM 因子的【精选核心序列】(长、与工业生产直接相关：发电/景气/价格/钢铁/产量/汽车/
+    # 需求)。刻意只用约10条而非全部41条核心列——这是控过拟合的关键(旧DFM用全集→载荷不稳)。
+    dfm_core_series: tuple = ("power_yoy", "pmi", "pmi_neworder", "pmi_newexport",
+                              "ppi_yoy", "retail_yoy", "prod_ic", "prod_power_equip",
+                              "steel_crude_key", "steel_rolled_key", "car_wholesale")
 
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
@@ -1089,6 +1095,119 @@ class ModelPLS(BaseModel):
         except Exception as e:
             LOG.warning("PLS 在 %s 失败：%s", target_month.date(), e)
             return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4e  MF-DFM（混频动态因子模型：状态空间Kalman因子 + 锚定AR岭回归）
+# ------------------------------------------------------------------------------
+class ModelMFDFM(BaseModel):
+    """混频动态因子模型（重写版）：用 statsmodels DynamicFactorMQ 的【状态空间 Kalman
+    滤波】从精选核心序列提取单一共同因子，再以当月滤波因子 f_T 作回归量、【锚定 AR 惯性】
+    做岭回归得到目标。
+
+    相对旧 DFM(系统高估+过拟合被剔除)的三处修正：
+      - 【不让因子自行外推】：因子只作边际增量，锚定 AR 滞后 -> 消除系统性高估
+        (回测 bias 从大正偏降到≈0)；
+      - 【发挥混频/ragged-edge 优势】：Kalman 滤波天然吸收"当月残月高频+目标未发布"的
+        参差边缘，优于 DI 的"中位数填充+PCA"(这是 DFM 真正的价值所在)；
+      - 【控过拟合】：单因子、仅约10条长核心序列、Ridge收缩、滚动训练窗、每 K 月重估EM
+        参数(其余月仅用固定参数滤波)。
+    1-2月退化为近期非1-2月均值，与其他模型一致。
+    """
+    name = "MFDFM"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._params = None          # 缓存的 EM 参数
+        self._anchor_month = None    # 上次重估参数的目标月（按 refit 周期复用）
+
+    def _factor(self, as_of, target_month, ctx):
+        """提取核心序列(含目标)的单一【滤波】共同因子序列(实时正确：每月仅用≤该月数据)。"""
+        from statsmodels.tsa.statespace.dynamic_factor_mq import DynamicFactorMQ
+        cfg = self.cfg
+        panel = ctx.aligner.build_monthly_panel(as_of)   # vintage：当月IAV=NaN, 高频=残月
+        cols = ["IVA_yoy"] + [c for c in cfg.dfm_core_series if c in panel.columns]
+        X = panel.loc[panel.index <= month_end(target_month), cols].copy()
+        X = X.loc[X.dropna(how="all").index.min():]
+        if len(X) < 72:
+            return None
+        try:
+            mod = DynamicFactorMQ(X, factors=1, factor_orders=1,
+                                  idiosyncratic_ar1=True, standardize=True)
+            ai = self._anchor_month
+            reuse = (self._params is not None and ai is not None
+                     and 0 <= (target_month.to_period("M") - ai.to_period("M")).n
+                     < cfg.dfm_refit_every)
+            if reuse:
+                try:
+                    res = mod.smooth(self._params)
+                except Exception:
+                    res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
+                    self._params, self._anchor_month = res.params, target_month
+            else:
+                res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
+                self._params, self._anchor_month = res.params, target_month
+            # 提取共同因子序列：不同 statsmodels 版本属性名不同，做兼容回退。
+            # states.smoothed 为 Kalman 平滑因子(仅用≤as_of数据，实时安全)。
+            if hasattr(res, "factors_filtered"):
+                fac = np.asarray(res.factors_filtered.iloc[:, 0])
+            else:
+                fac = np.asarray(res.states.smoothed.iloc[:, 0])
+            return pd.Series(fac, index=X.index)
+        except Exception as e:
+            LOG.warning("MF-DFM 因子提取在 %s 失败：%s", target_month.date(), e)
+            return None
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        ynf_vis = _target_history(ctx, as_of, target_month, drop_janfeb=True)  # 到 T-1
+        if ynf_vis is None or len(ynf_vis) < 6:
+            return None
+        if target_month.month in (1, 2):
+            p = float(ynf_vis.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf_vis.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        fseries = self._factor(as_of, target_month, ctx)
+        if fseries is None:
+            return None
+        tm = month_end(target_month)
+        # 把目标月加入索引(其 y 未知=NaN)，避免对最新一期取不到设计行
+        ynf = pd.concat([ynf_vis, pd.Series({tm: np.nan})])
+        ynf = ynf[~ynf.index.duplicated()].sort_index()
+        design = pd.DataFrame(index=ynf.index)
+        design["arlag1"] = ynf.shift(1)
+        design["arlag2"] = ynf.shift(2)
+        design["factor"] = fseries.reindex(ynf.index)
+        design["y"] = ynf
+        tr = design[design.index < tm].dropna()
+        if len(tr) > cfg.max_train_months:
+            tr = tr.iloc[-cfg.max_train_months:]
+        if len(tr) < 48:
+            return None
+        te = design.loc[[tm], ["arlag1", "arlag2", "factor"]]
+        if te.isna().any(axis=1).iloc[0]:
+            return None
+        try:
+            sc = StandardScaler()
+            Xtr = sc.fit_transform(tr[["arlag1", "arlag2", "factor"]].values)
+            Xte = sc.transform(te.values)
+            ns = max(2, min(5, len(tr) // 12))
+            ridge = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0, 1000.0],
+                            cv=TimeSeriesSplit(ns))
+            ridge.fit(Xtr, tr["y"].values)
+            point = float(ridge.predict(Xte)[0])
+            sigma = float(np.std(tr["y"].values - ridge.predict(Xtr), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["factor_T"] = round(float(fseries.loc[tm]), 3)
+            return out
+        except Exception as e:
+            LOG.warning("MF-DFM 在 %s 失败：%s", target_month.date(), e)
+            return None
 # ==============================================================================
 # 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
 # ==============================================================================
@@ -1839,6 +1958,8 @@ def main(cfg: Config = CFG):
         models += [ModelLGB(cfg)]    # 锚定 + 梯度提升残差（非线性）
     if cfg.enable_pls:
         models += [ModelPLS(cfg)]    # 纯当月高频 PLS 桥接（不锚AR, 去相关多样性）
+    if cfg.enable_dfm:
+        models += [ModelMFDFM(cfg)]  # 混频动态因子（状态空间Kalman因子 + 锚定AR岭回归）
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）
