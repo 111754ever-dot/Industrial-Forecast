@@ -134,14 +134,12 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 评估/组合集合: AR + ARX + DI + LightGBM + VAR（五类机制：自回归/线性高频桥接/
-    # 因子/非线性/向量自回归系统）。
+    # 组合集合: AR + ARX + DI + LightGBM + PLS（五类机制：自回归/线性高频桥接/PCA因子/
+    # 非线性/PLS纯高频桥接）。AR/ARX/DI 误差高度相关(0.87-0.97)，多样性已饱和；LightGBM
+    # 与 PLS 提供去相关增量（PLS 不锚AR、误差仅0.3相关，凭去相关改善组合）。
     enable_probe_models: bool = True     # 纳入 LightGBM（锚定+GBM残差，非线性）
-    enable_var: bool = True              # 纳入 VAR（目标+月度宏观同频系统，h=1外推）
-    # VAR 系统变量（月度、近似平稳的同比/比率口径）。目标必为第一个。
-    var_system_vars: tuple = ("IVA_yoy", "power_yoy", "ppi_yoy", "retail_yoy",
-                              "pmi", "pmi_neworder", "ppirm_yoy")
-    var_max_lag: int = 6                 # VAR 最大滞后阶（由 BIC 在 1..该值内选）
+    enable_pls: bool = True              # 纳入 PLS（纯当月高频桥接, 不锚AR, 去相关多样性）
+    pls_components: int = 2              # PLS 成分数（小，抗过拟合）
 
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
@@ -1014,75 +1012,82 @@ class ModelARX(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# 8.4d  VAR（向量自回归，目标+月度宏观同频系统）
+# 8.4d  PLS（纯当月高频桥接 nowcast，偏最小二乘，【不锚定AR】——为组合提供去相关多样性）
 # ------------------------------------------------------------------------------
-class ModelVAR(BaseModel):
-    """向量自回归(VAR)：将【目标 + 若干月度宏观】放入同频系统联合估计，h=1 外推取目标分量。
+class ModelPLS(BaseModel):
+    """偏最小二乘(PLS)高频桥接 nowcast：非1-2月目标 ~ 仅【当月可观测高频(_t0)】，
+    PLS 提取与目标最相关的监督成分，【刻意不含任何 AR 滞后】。
 
-    结构性局限（务必知悉）：VAR 要求同频、整向量联合外推。在 as_of(T) 时点，月度宏观与
-    目标当月均未发布，故 VAR 只能用 ≤T-1 的信息向前推一步，【无法吸收当月已观测的高频
-    nowcast】——这是它相对 DI/ARX 的天然劣势(经判决性实验证实其回测显著弱于 DI)。此处
-    按需纳入组合以观察其实际贡献。1-2 月退化为近期非1-2月均值，与其他模型一致。
+    存在意义（经诊断实验确认）：AR/ARX/DI 误差两两相关高达 0.87-0.97（皆锚定 AR 惯性），
+    多样性已近饱和。本模型从【纯当月高频、无惯性锚】的不同角度切入，误差与现有模型仅
+    0.3 相关——虽单体 RMSE 较高，但并入组合后凭【去相关】降低组合方差(回测 1.204->1.168)。
+      - 与 DI 的区别：DI 用 PCA(无监督因子)+AR 锚；本模型用 PLS(监督成分)且无 AR 锚；
+      - 受小权重(逆MSE^2)与极端值护栏保护，不会因偶发噪声主导结果；
+      - 1-2月退化为近期非1-2月均值，与其他模型一致。
     """
-    name = "VAR"
+    name = "PLS"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
-        from statsmodels.tsa.api import VAR
+        from sklearn.cross_decomposition import PLSRegression
+        from sklearn.preprocessing import StandardScaler
         cfg = self.cfg
+        feat = ctx.realtime_feature_matrix()
+        if target_month not in feat.index:
+            return None
+        ytar = feat["__target__"]
+        nf = feat.index[~feat.index.month.isin([1, 2])]
         if target_month.month in (1, 2):
-            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
-            if ynf is None or len(ynf) < 6:
+            ynf = ytar.loc[nf].dropna()
+            ynf = ynf[ynf.index < target_month]
+            if len(ynf) < 6:
                 return None
             p = float(ynf.tail(cfg.janfeb_fallback_k).mean())
             out = Prediction(point=p)
             _gauss_interval(out, p, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
             return out
-        panel = ctx.aligner.build_monthly_panel(as_of)
-        vars_ = [v for v in cfg.var_system_vars if v in panel.columns]
-        if "IVA_yoy" not in vars_ or len(vars_) < 2:
+        # 仅当月高频(_t0)、排除目标自回归 y_* 与春节哑变量——纯 nowcast 信号、无 AR 锚
+        hf_t0 = [c for c in feat.columns if c.endswith("_t0")
+                 and not c.startswith("y_") and "__" not in c]
+        test_row = feat.loc[target_month]
+        train_idx = nf[(nf < target_month) & ytar.loc[nf].notna()]
+        if len(train_idx) > cfg.max_train_months:
+            train_idx = train_idx[-cfg.max_train_months:]
+        if len(train_idx) < 36:
             return None
-        # as_of 仅见到 < target_month 的月度值（目标与月度宏观当月均未发布）
-        sub = panel.loc[panel.index < month_end(target_month), vars_].copy()
-        sub = sub.dropna(how="all")
-        valid = [v for v in vars_ if sub[v].notna().any()]
-        if "IVA_yoy" not in valid or len(valid) < 2:
+        ytr = ytar.loc[train_idx]
+        min_cov = max(24, len(train_idx) // 3)
+        cand = [c for c in hf_t0 if pd.notna(test_row[c])
+                and feat.loc[train_idx, c].notna().sum() >= min_cov]
+        corr = {}
+        for c in cand:
+            v = feat.loc[train_idx, c]; mk = v.notna() & ytr.notna()
+            if mk.sum() >= 24 and v[mk].std() > 1e-9:
+                corr[c] = abs(np.corrcoef(v[mk], ytr[mk])[0, 1])
+        top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                    reverse=True)[:cfg.bridge_topk_features]]
+        if len(top) < 5:
             return None
-        start = max(sub[v].first_valid_index() for v in valid)
-        sub = sub.loc[sub.index >= start, valid]
-        # 系统内部小缺口按时间方向插值（仍只用 <T 的数据，无前视）
-        sub = sub.interpolate(limit_direction="both").dropna()
-        if len(sub) > cfg.max_train_months:
-            sub = sub.iloc[-cfg.max_train_months:]
-        if len(sub) < 60:
-            return None
+        Xtr = feat.loc[train_idx, top]; Xte = feat.loc[[target_month], top]
+        med = Xtr.median()
+        Xtr = Xtr.fillna(med).fillna(0.0); Xte = Xte.fillna(med).fillna(0.0)
         try:
-            model = VAR(sub.values)
-            maxlag = max(1, int(min(cfg.var_max_lag,
-                                    max(1, len(sub) // (5 * len(valid))))))
-            try:
-                sel = model.select_order(maxlags=maxlag)
-                p = int(sel.selected_orders.get("bic", 1))
-            except Exception:
-                p = 1
-            p = max(1, min(p, maxlag))
-            res = model.fit(p)
-            fc = res.forecast(sub.values[-p:], steps=1)
-            iva_idx = valid.index("IVA_yoy")
-            point = float(fc[0, iva_idx])
-            try:
-                sigma = float(np.sqrt(res.sigma_u[iva_idx, iva_idx]))
-            except Exception:
-                sigma = float(np.std(sub["IVA_yoy"].values, ddof=1))
+            sc = StandardScaler()
+            Xs = sc.fit_transform(Xtr.values); Xe = sc.transform(Xte.values)
+            nc = int(min(cfg.pls_components, Xs.shape[1], max(1, len(ytr) // 30)))
+            pls = PLSRegression(n_components=max(1, nc))
+            pls.fit(Xs, ytr.values)
+            point = float(pls.predict(Xe).ravel()[0])
+            sigma = float(np.std(ytr.values - pls.predict(Xs).ravel(), ddof=1))
             out = Prediction(point=point)
             _gauss_interval(out, point, sigma, cfg)
-            out.extra["var_lag"] = p
-            out.extra["var_vars"] = valid
+            out.extra["n_features"] = len(top)
+            out.extra["n_components"] = max(1, nc)
             return out
         except Exception as e:
-            LOG.warning("VAR 在 %s 失败：%s", target_month.date(), e)
+            LOG.warning("PLS 在 %s 失败：%s", target_month.date(), e)
             return None
 # ==============================================================================
 # 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
@@ -1823,8 +1828,8 @@ def main(cfg: Config = CFG):
         aligner, as_of_live, apply_pub_lag=False)
 
     # 3) 模型集合 —— 多类机制并存，提供方法学多样性：
-    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型)
-    #    + LightGBM(非线性) + VAR(同频系统)。是否剔除由 ensemble_gate_models 决定。
+    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型) + LightGBM(非线性)。
+    #    是否剔除由 ensemble_gate_models 决定。
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
@@ -1832,8 +1837,8 @@ def main(cfg: Config = CFG):
     ]
     if cfg.enable_probe_models:
         models += [ModelLGB(cfg)]    # 锚定 + 梯度提升残差（非线性）
-    if cfg.enable_var:
-        models += [ModelVAR(cfg)]    # 向量自回归（目标+月度宏观同频系统, h=1 外推）
+    if cfg.enable_pls:
+        models += [ModelPLS(cfg)]    # 纯当月高频 PLS 桥接（不锚AR, 去相关多样性）
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）

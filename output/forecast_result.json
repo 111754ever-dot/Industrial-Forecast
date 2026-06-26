@@ -1,54 +1,54 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.455,
-  "lower_80": 2.904,
-  "upper_80": 6.005,
-  "lower_95": 1.862,
-  "upper_95": 7.047,
+  "point_forecast": 4.54,
+  "lower_80": 3.039,
+  "upper_80": 6.04,
+  "lower_95": 1.955,
+  "upper_95": 7.124,
   "per_model": {
     "AR": 4.757,
     "ARX": 4.021,
     "DI": 4.325,
     "LightGBM": 4.833,
-    "VAR": 4.275
+    "PLS": 5.485
   },
   "top_drivers": {
     "ensemble_composition": [
       {
         "model": "AR",
-        "weight": 0.272,
+        "weight": 0.257,
         "point": 4.757,
-        "weighted_contribution": 1.295
+        "weighted_contribution": 1.225
       },
       {
         "model": "ARX",
-        "weight": 0.265,
+        "weight": 0.251,
         "point": 4.021,
-        "weighted_contribution": 1.065
+        "weighted_contribution": 1.007
       },
       {
         "model": "DI",
-        "weight": 0.252,
+        "weight": 0.239,
         "point": 4.325,
-        "weighted_contribution": 1.092
+        "weighted_contribution": 1.033
       },
       {
         "model": "LightGBM",
-        "weight": 0.185,
+        "weight": 0.175,
         "point": 4.833,
-        "weighted_contribution": 0.894
+        "weighted_contribution": 0.845
       },
       {
-        "model": "VAR",
-        "weight": 0.025,
-        "point": 4.275,
-        "weighted_contribution": 0.109
+        "model": "PLS",
+        "weight": 0.078,
+        "point": 5.485,
+        "weighted_contribution": 0.429
       }
     ],
     "feature_drivers": [
       {
         "model": "ARX",
-        "weight": 0.265,
+        "weight": 0.251,
         "top_features": [
           {
             "feature": "arlag3",
@@ -94,7 +94,7 @@
       },
       {
         "model": "LightGBM",
-        "weight": 0.185,
+        "weight": 0.175,
         "top_features": [
           {
             "feature": "steel_pig_key_t0",
@@ -139,6 +139,6 @@
         ]
       }
     ],
-    "note": "组合由 AR/ARX/DI/LightGBM/VAR 构成(权重 AR=0.27, ARX=0.26, DI=0.25, LightGBM=0.18, VAR=0.03)，三者均【锚定 AR 惯性】。预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正——经 DM 检验，高频对 AR 无显著增量。"
+    "note": "组合由 AR/ARX/DI/LightGBM/PLS 构成(权重 AR=0.26, ARX=0.25, DI=0.24, LightGBM=0.17, PLS=0.08)，三者均【锚定 AR 惯性】。预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正——经 DM 检验，高频对 AR 无显著增量。"
   }
 }
