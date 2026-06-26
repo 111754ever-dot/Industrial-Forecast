@@ -1644,7 +1644,8 @@ def sanity_clip(point: float, raw: dict, cfg: Config,
     s = raw[cfg.sheet_target].set_index("date")[
         "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
     s.index = to_month_index(s.index)
-    recent = s.loc[:target_month].tail(12)
+    # 护栏范围基于近12个【非1-2月】实际值（剔除1-2月人造极值，否则范围被撑到无意义）
+    recent = s[~s.index.month.isin([1, 2])].loc[:target_month].tail(12)
     if len(recent) < 6:
         return point, False
     pad = cfg.sanity_clip_pp * (2.5 if target_month.month in (1, 2) else 1.0)
@@ -1676,13 +1677,12 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
             "weighted_contribution": round(float(w) * float(pm.point), 3)})
 
     dom = max(weights, key=weights.get)
-    if dom == cfg.benchmark_name and per_model.get(cfg.benchmark_name) is not None:
-        ll = per_model[cfg.benchmark_name]
+    dompm = per_model.get(dom)
+    if dom == cfg.benchmark_name and dompm is not None:
         out["note"] = (
-            f"组合由基准 LocalLevel 主导(权重 {weights[dom]:.2f})：预测≈最近 "
-            f"{cfg.locallevel_k} 个非1-2月实际值的均值 = {ll.point:.2f}。"
-            f"即【主要驱动是近期工业增加值水平本身】，高频指标未提供超越基准的"
-            f"增量信号(见 DM 检验)。")
+            f"组合由基准模型 {dom} 主导(权重 {weights[dom]:.2f}，点预测 {dompm.point:.2f})："
+            f"预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，"
+            f"高频指标未提供超越基准的显著增量(见 DM 检验)。")
 
     for name, w in weights.items():
         if w <= 0:
