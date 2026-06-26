@@ -134,14 +134,22 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 评估集合: AR + ARX + DI + LightGBM（四类机制：自回归/线性高频桥接/因子/非线性）。
-    # 是否进入最终组合由 DM 门控决定(不显著差于基准才纳入)；LightGBM 回测显著差于AR，
-    # 故通常被门控剔除，作为交叉验证参考显示，不影响最终预测。
-    enable_probe_models: bool = True
+    # 评估/组合集合: AR + ARX + DI + LightGBM + VAR（五类机制：自回归/线性高频桥接/
+    # 因子/非线性/向量自回归系统）。
+    enable_probe_models: bool = True     # 纳入 LightGBM（锚定+GBM残差，非线性）
+    enable_var: bool = True              # 纳入 VAR（目标+月度宏观同频系统，h=1外推）
+    # VAR 系统变量（月度、近似平稳的同比/比率口径）。目标必为第一个。
+    var_system_vars: tuple = ("IVA_yoy", "power_yoy", "ppi_yoy", "retail_yoy",
+                              "pmi", "pmi_neworder", "ppirm_yoy")
+    var_max_lag: int = 6                 # VAR 最大滞后阶（由 BIC 在 1..该值内选）
 
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
     benchmark_name: str = "AR"
+    # 基准门控开关：True=仅"不显著差于基准"的模型进组合(剔除显著更差者)；
+    # False=【不剔除任何模型】，五个模型全部纳入逆MSE加权(DM 仍计算并报告，仅不据此剔除)。
+    # 当前按用户要求设为 False，以观察 AR+ARX+DI+LightGBM+VAR 五模型组合效果。
+    ensemble_gate_models: bool = False
     janfeb_fallback_k: int = 6            # 1-2月兜底:用最近K个非1-2月观测均值
     ensemble_keep_ratio: float = 1.02     # 仅保留 RMSE<=基准*该比值 的模型(基准本身恒保留)
     dm_significance: float = 0.10         # DM检验显著性水平
@@ -1003,6 +1011,79 @@ class ModelARX(BaseModel):
         except Exception as e:
             LOG.warning("ARX 在 %s 失败：%s", target_month.date(), e)
             return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4d  VAR（向量自回归，目标+月度宏观同频系统）
+# ------------------------------------------------------------------------------
+class ModelVAR(BaseModel):
+    """向量自回归(VAR)：将【目标 + 若干月度宏观】放入同频系统联合估计，h=1 外推取目标分量。
+
+    结构性局限（务必知悉）：VAR 要求同频、整向量联合外推。在 as_of(T) 时点，月度宏观与
+    目标当月均未发布，故 VAR 只能用 ≤T-1 的信息向前推一步，【无法吸收当月已观测的高频
+    nowcast】——这是它相对 DI/ARX 的天然劣势(经判决性实验证实其回测显著弱于 DI)。此处
+    按需纳入组合以观察其实际贡献。1-2 月退化为近期非1-2月均值，与其他模型一致。
+    """
+    name = "VAR"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from statsmodels.tsa.api import VAR
+        cfg = self.cfg
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            p = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        panel = ctx.aligner.build_monthly_panel(as_of)
+        vars_ = [v for v in cfg.var_system_vars if v in panel.columns]
+        if "IVA_yoy" not in vars_ or len(vars_) < 2:
+            return None
+        # as_of 仅见到 < target_month 的月度值（目标与月度宏观当月均未发布）
+        sub = panel.loc[panel.index < month_end(target_month), vars_].copy()
+        sub = sub.dropna(how="all")
+        valid = [v for v in vars_ if sub[v].notna().any()]
+        if "IVA_yoy" not in valid or len(valid) < 2:
+            return None
+        start = max(sub[v].first_valid_index() for v in valid)
+        sub = sub.loc[sub.index >= start, valid]
+        # 系统内部小缺口按时间方向插值（仍只用 <T 的数据，无前视）
+        sub = sub.interpolate(limit_direction="both").dropna()
+        if len(sub) > cfg.max_train_months:
+            sub = sub.iloc[-cfg.max_train_months:]
+        if len(sub) < 60:
+            return None
+        try:
+            model = VAR(sub.values)
+            maxlag = max(1, int(min(cfg.var_max_lag,
+                                    max(1, len(sub) // (5 * len(valid))))))
+            try:
+                sel = model.select_order(maxlags=maxlag)
+                p = int(sel.selected_orders.get("bic", 1))
+            except Exception:
+                p = 1
+            p = max(1, min(p, maxlag))
+            res = model.fit(p)
+            fc = res.forecast(sub.values[-p:], steps=1)
+            iva_idx = valid.index("IVA_yoy")
+            point = float(fc[0, iva_idx])
+            try:
+                sigma = float(np.sqrt(res.sigma_u[iva_idx, iva_idx]))
+            except Exception:
+                sigma = float(np.std(sub["IVA_yoy"].values, ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["var_lag"] = p
+            out.extra["var_vars"] = valid
+            return out
+        except Exception as e:
+            LOG.warning("VAR 在 %s 失败：%s", target_month.date(), e)
+            return None
 # ==============================================================================
 # 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
 # ==============================================================================
@@ -1338,9 +1419,17 @@ class Ensemble:
                                 and not (dm > 0 and pval < cfg.dm_significance))
                 if rmses[name] <= bench_rmse * cfg.ensemble_keep_ratio or dm_not_worse:
                     keep.append(name)
+            # 门控开关：关闭时【不剔除任何模型】，全部纳入组合(DM 仍计算并报告)。
+            if not cfg.ensemble_gate_models:
+                keep = [bench] + [n for n in rmses if n != bench]
             dropped = [n for n in rmses if n not in keep]
-            LOG.info("基准=%s(RMSE=%.3f)；保留模型=%s；剔除(显著/明显差于基准)=%s",
-                     bench, bench_rmse, keep, dropped)
+            if cfg.ensemble_gate_models:
+                LOG.info("基准=%s(RMSE=%.3f)；保留模型=%s；剔除(显著/明显差于基准)=%s",
+                         bench, bench_rmse, keep, dropped)
+            else:
+                LOG.info("基准门控已关闭(ensemble_gate_models=False)：基准=%s(RMSE=%.3f)；"
+                         "全部 %d 个模型纳入组合=%s（DM 仅报告不剔除）",
+                         bench, bench_rmse, len(keep), keep)
             for name, (r, dm, pval) in self.dm_results.items():
                 verdict = ("显著优于基准" if (dm is not None and np.isfinite(dm) and dm < 0 and pval < cfg.dm_significance)
                            else "显著差于基准" if (dm is not None and np.isfinite(dm) and dm > 0 and pval < cfg.dm_significance)
@@ -1733,17 +1822,18 @@ def main(cfg: Config = CFG):
     ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
         aligner, as_of_live, apply_pub_lag=False)
 
-    # 3) 模型集合 —— 三类机制各一，均锚定 AR 惯性、避免高频高估，提供方法学多样性：
-    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型)。门控按"是否显著差于
-    #    基准"决定进组合。
+    # 3) 模型集合 —— 多类机制并存，提供方法学多样性：
+    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型)
+    #    + LightGBM(非线性) + VAR(同频系统)。是否剔除由 ensemble_gate_models 决定。
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
         ModelDI(cfg),            # 扩散指数/因子模型（AR滞后 + 高频PCA因子, 岭回归, Stock-Watson）
     ]
-    # 可选交叉验证模型（默认关闭）：非线性混合（锚定+GBM残差），回测显著差于AR，作参考。
     if cfg.enable_probe_models:
         models += [ModelLGB(cfg)]    # 锚定 + 梯度提升残差（非线性）
+    if cfg.enable_var:
+        models += [ModelVAR(cfg)]    # 向量自回归（目标+月度宏观同频系统, h=1 外推）
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）
