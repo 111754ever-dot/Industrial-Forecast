@@ -1,14 +1,14 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.412,
-  "lower_80": 2.616,
-  "upper_80": 6.208,
-  "lower_95": 2.188,
-  "upper_95": 6.636,
+  "point_forecast": 4.394,
+  "lower_80": 2.598,
+  "upper_80": 6.19,
+  "lower_95": 2.17,
+  "upper_95": 6.618,
   "per_model": {
     "AR": 4.757,
     "LocalLevel": 5.2,
-    "ARX": 4.057
+    "ARX": 4.021
   },
   "top_drivers": {
     "ensemble_composition": [
@@ -21,8 +21,8 @@
       {
         "model": "ARX",
         "weight": 0.493,
-        "point": 4.057,
-        "weighted_contribution": 2.001
+        "point": 4.021,
+        "weighted_contribution": 1.983
       }
     ],
     "feature_drivers": [

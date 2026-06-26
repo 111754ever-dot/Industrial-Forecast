@@ -506,11 +506,20 @@ class FrequencyAligner:
             return cfg.pub_lag_tenday_days
         return cfg.pub_lag_week_days   # 兜底
 
-    def _visible_raw(self, ind: Indicator, as_of: pd.Timestamp) -> pd.Series:
-        """返回 as_of 时点可见的原始序列（参考期末 + 发布滞后 <= as_of）。"""
+    def _visible_raw(self, ind: Indicator, as_of: pd.Timestamp,
+                     apply_pub_lag: bool = True) -> pd.Series:
+        """返回 as_of 时点可见的原始序列。
+
+        apply_pub_lag=True（回测）：参考期末 + 发布滞后 <= as_of，重建历史可得性、防未来泄漏。
+        apply_pub_lag=False（实盘）：参考期末 <= as_of 即可——自动更新表"出现即可得"，
+          不应再按假定滞后删除表中已存在的数据。
+        """
         s = self._series[ind.key]
-        lag = pd.Timedelta(days=self._pub_lag_days(ind))
-        visible_mask = (s.index + lag) <= as_of
+        if apply_pub_lag:
+            lag = pd.Timedelta(days=self._pub_lag_days(ind))
+            visible_mask = (s.index + lag) <= as_of
+        else:
+            visible_mask = s.index <= as_of
         return s[visible_mask]
 
     def _aggregate_highfreq_to_month(self, s: pd.Series, agg: str) -> pd.Series:
@@ -560,12 +569,14 @@ class FrequencyAligner:
                 yoy.loc[last] = np.nan
         return yoy.replace([np.inf, -np.inf], np.nan)
 
-    def build_monthly_panel(self, as_of: pd.Timestamp) -> pd.DataFrame:
-        """构造 as_of 时点的月度面板（列=指标内部名，行=月末），含目标列。"""
+    def build_monthly_panel(self, as_of: pd.Timestamp,
+                            apply_pub_lag: bool = True) -> pd.DataFrame:
+        """构造 as_of 时点的月度面板（列=指标内部名，行=月末），含目标列。
+        apply_pub_lag=False 时用全表可得性（实盘：表中出现即可得）。"""
         cfg = self.cfg
         cols = {}
         for ind in self.indicators:
-            vis = self._visible_raw(ind, as_of)
+            vis = self._visible_raw(ind, as_of, apply_pub_lag)
             if len(vis) == 0:
                 continue
             if ind.sheet == cfg.sheet_month or ind.role == "target":
@@ -1099,6 +1110,26 @@ class Context:
         # 关键：特征保持 vintage，但【标签 __target__ 必须用已实现的真实目标值】
         # (vintage 行的当月目标未发布=NaN，不能当训练标签；其余 y 滞后特征仍是 vintage)
         rt["__target__"] = full["IVA_yoy"].reindex(rt.index)
+
+        # 实盘修正：对【尚无已实现目标的当月/未来月】，用【全表(无pub_lag)】重建其特征行。
+        # 理由：自动更新表"出现即可得"，实盘不应再按假定发布滞后删除表中已存在的数据；
+        # pub_lag 只用于历史回测重建可得性。训练行(历史已实现)仍按 vintage 不变。
+        last_real = rt.index[rt["__target__"].notna()]
+        if len(last_real):
+            cutoff = last_real.max()
+            live_rows = rt.index[rt.index > cutoff]
+            if len(live_rows):
+                collection = infer_collection_date(self.aligner.raw)
+                panel_full = FrequencyAligner.build_monthly_panel(
+                    self.aligner, collection, apply_pub_lag=False)
+                feat_full = self.fb.build(panel_full)
+                feat_cols = [c for c in rt.columns if c != "__target__"
+                             and c in feat_full.columns]
+                for m in live_rows:
+                    if m in feat_full.index:
+                        rt.loc[m, feat_cols] = feat_full.loc[m, feat_cols]
+                LOG.info("实盘行已用全表(无pub_lag)重建：%s", [str(x.date()) for x in live_rows])
+
         self._rt_feat = rt
         LOG.info("已构建真实时点(vintage)特征矩阵：%s", rt.shape)
         return self._rt_feat
