@@ -22,14 +22,21 @@
 * 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
 * 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
   conformal)校准"，保证经验覆盖达标且不过窄。
-* 模型集合（三类机制各一，均【锚定 AR 惯性】以避免纯高频模型的系统性高估，提供方法学
-  多样性；门控按 Diebold-Mariano 检验"是否显著差于基准"决定进组合）：
+* 模型集合（六类机制并存，提供方法学多样性。多数成员【锚定 AR 惯性】以避免纯高频模型的
+  系统性高估；组合提升的关键是【误差去相关】而非单体精度，故保留单体较弱但去相关的成员）：
     - AR(p)        ：单变量自回归（基准/锚），BIC 定阶；
     - ARX          ：AR 滞后 + 高频外生（弹性网, 时序CV），线性桥接；
     - DI           ：扩散指数 / 因子增广回归（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson 2002；
-    - LightGBM(可选)：锚定 + 梯度提升残差（非线性），回测显著差于AR，默认关，作交叉验证参考。
-  说明：经无泄漏回测 + DM 检验，在"当月同比/累计同比"口径下高频指标对 AR 无显著增量；故三个
-  核心模型都锚定 AR、仅让高频/因子作受限边际修正，彼此印证、机制互补。
+    - LightGBM     ：锚定 + 梯度提升残差（非线性）；
+    - PLS          ：纯当月高频桥接（偏最小二乘，【不锚 AR】），误差与其余模型仅~0.3相关，
+                     凭去相关改善组合；
+    - MFDFM        ：混频动态因子（DynamicFactorMQ 状态空间 Kalman 因子 + 锚定 AR 岭回归），
+                     发挥混频/ragged-edge 优势，单体回测最佳之一。
+  门控：是否按 Diebold-Mariano 检验"显著差于基准"剔除成员由 cfg.ensemble_gate_models 控制；
+  默认 False（不剔除、全部纳入逆 MSE^2 加权），因逆误差加权本身即对弱模型软降权，且 PLS 这类
+  "单体弱但去相关"的成员不应被基于单体精度的门控误剔。设 True 可恢复基准门控。
+  说明：经无泄漏回测 + DM 检验，在"当月同比/累计同比"口径下高频指标对 AR 无显著增量；故多数
+  成员锚定 AR、仅让高频/因子作受限边际修正，彼此印证、机制互补。
 
 真实时点（ragged edge）口径
 --------------------------
@@ -151,8 +158,9 @@ class Config:
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
     benchmark_name: str = "AR"
     # 基准门控开关：True=仅"不显著差于基准"的模型进组合(剔除显著更差者)；
-    # False=【不剔除任何模型】，五个模型全部纳入逆MSE加权(DM 仍计算并报告，仅不据此剔除)。
-    # 当前按用户要求设为 False，以观察 AR+ARX+DI+LightGBM+VAR 五模型组合效果。
+    # False=【不剔除任何模型】，全部成员纳入逆MSE^2加权(DM 仍计算并报告，仅不据此剔除)。
+    # 默认 False：逆误差加权本身即对弱模型软降权，且"单体弱但去相关"的成员(如PLS)不应被
+    # 基于单体精度的门控误剔。设 True 可恢复基准门控。
     ensemble_gate_models: bool = False
     janfeb_fallback_k: int = 6            # 1-2月兜底:用最近K个非1-2月观测均值
     ensemble_keep_ratio: float = 1.02     # 仅保留 RMSE<=基准*该比值 的模型(基准本身恒保留)
@@ -160,11 +168,9 @@ class Config:
     sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
 
     # ---- 模型 ----
-    dfm_factors: int = 2             # DFM 共同因子个数
-    dfm_factor_order: int = 2        # 因子 VAR 阶
-    dfm_maxiter: int = 100           # EM 迭代上限
-    enet_l1_ratios: tuple = (0.1, 0.5, 0.7, 0.9, 0.95, 1.0)
-    lgb_quantiles: tuple = (0.025, 0.10, 0.50, 0.90, 0.975)
+    dfm_factors: int = 2             # DI 的 PCA 共同因子个数
+    dfm_maxiter: int = 100           # MF-DFM 的 EM 迭代上限
+    enet_l1_ratios: tuple = (0.1, 0.5, 0.7, 0.9, 0.95, 1.0)  # ARX 弹性网 l1_ratio 网格
 
     # ---- 区间 ----
     interval_levels: tuple = (0.80, 0.95)
@@ -1729,8 +1735,9 @@ class Reporter:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
         styles = {"AR": ("#1f77b4", "-"), "ARX": ("#d62728", "--"),
-                  "DI": ("#9467bd", "-."),
-                  "LightGBM": ("#2ca02c", "-."), "ENSEMBLE": ("#ff7f0e", "-")}
+                  "DI": ("#9467bd", "-."), "LightGBM": ("#2ca02c", "-."),
+                  "PLS": ("#8c564b", ":"), "MFDFM": ("#17becf", "--"),
+                  "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
         ax = axes[0]
@@ -1855,7 +1862,7 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
     修复点：旧版恒取 LightGBM 特征重要度，但门控后组合可能根本没用 LightGBM，
     导致"主要驱动"与最终预测值无关。新版：
       - ensemble_composition：组合里每个模型的权重、点预测、加权贡献；
-      - note：若由基准(AR)主导，明确说明"预测主要由目标自身惯性决定，高频无增量信号"；
+      - note：说明组合机制构成与"以目标自身惯性为主、高频/因子作边际及去相关增量"；
       - feature_drivers：仅来自【权重>0】且能给出特征解释的模型(LGB重要度 / ARX系数)。
     """
     out = {"ensemble_composition": [], "feature_drivers": [], "note": ""}
@@ -1870,13 +1877,17 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
             "point": round(float(pm.point), 3),
             "weighted_contribution": round(float(w) * float(pm.point), 3)})
 
-    # 三个核心模型(AR/ARX/DI)均锚定 AR 惯性，故预测主要由自身历史惯性决定
+    # 机制说明：多数成员(AR/ARX/DI/LightGBM/MFDFM)锚定 AR 惯性，PLS 为纯高频去相关补充。
     if cfg.benchmark_name in weights:
+        anchored = [k for k in weights if k != "PLS"]
         out["note"] = (
             f"组合由 {('/'.join(weights.keys()))} 构成(权重 "
-            f"{', '.join('%s=%.2f' % (k, v) for k, v in weights.items())})，三者均【锚定 AR 惯性】。"
-            f"预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的"
-            f"边际修正——经 DM 检验，高频对 AR 无显著增量。")
+            f"{', '.join('%s=%.2f' % (k, v) for k, v in weights.items())})。"
+            f"其中 {('/'.join(anchored))} 均【锚定 AR 惯性】，预测主要由【工业增加值自身历史的"
+            f"惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正"
+            f"（经 DM 检验高频对 AR 无显著增量）"
+            + ("；PLS 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
+               if "PLS" in weights else "。"))
 
     for name, w in weights.items():
         if w <= 0:
@@ -1941,14 +1952,15 @@ def main(cfg: Config = CFG):
     ctx = Context(cfg, aligner, fb)
     _wire_context_cache(ctx)
 
-    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/
-    #     DFM/ARX/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
+    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/ARX/DI/
+    #     MFDFM/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
     ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
         aligner, as_of_live, apply_pub_lag=False)
 
-    # 3) 模型集合 —— 多类机制并存，提供方法学多样性：
-    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型) + LightGBM(非线性)。
-    #    是否剔除由 ensemble_gate_models 决定。
+    # 3) 模型集合 —— 六类机制并存，提供方法学多样性：
+    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(PCA因子) + LightGBM(非线性)
+    #    + PLS(纯高频去相关) + MFDFM(状态空间混频动态因子)。
+    #    是否按 DM 门控剔除由 cfg.ensemble_gate_models 决定（默认 False=全部纳入）。
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
