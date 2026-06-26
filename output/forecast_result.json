@@ -8,7 +8,8 @@
   "per_model": {
     "AR": 4.757,
     "ARX": 4.021,
-    "DI": 4.325
+    "DI": 4.325,
+    "LightGBM": 4.833
   },
   "top_drivers": {
     "ensemble_composition": [

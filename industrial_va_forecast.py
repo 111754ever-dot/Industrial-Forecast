@@ -134,9 +134,10 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 核心(默认运行、进DM门控组合): AR + ARX + DI（三类机制各一，均锚定AR）。
-    # 可选(默认关闭): LightGBM(锚定+GBM残差,非线性)——回测显著差于AR,开启后作交叉验证参考。
-    enable_probe_models: bool = False
+    # 评估集合: AR + ARX + DI + LightGBM（四类机制：自回归/线性高频桥接/因子/非线性）。
+    # 是否进入最终组合由 DM 门控决定(不显著差于基准才纳入)；LightGBM 回测显著差于AR，
+    # 故通常被门控剔除，作为交叉验证参考显示，不影响最终预测。
+    enable_probe_models: bool = True
 
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
