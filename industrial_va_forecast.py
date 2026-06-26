@@ -1755,7 +1755,7 @@ def main(cfg: Config = CFG):
     loader = DataLoader(cfg, indicators)
     raw = loader.load()
 
-    # 1b) 预测时点不写死：按采集日与目标月起点的间隔(gap)确定 as_of，使实盘 as_of==采集日
+    # 1b) 预测时点不写死、不需外部采集日：数据前沿(表内最新日期)即 run_date，全部从表推断。
     run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
                 else infer_collection_date(raw)).normalize()
     target_month = detect_target_month(raw, cfg)
@@ -1763,6 +1763,11 @@ def main(cfg: Config = CFG):
     as_of_live = asof_for_target(cfg, target_month)   # == run_date（按构造）
     LOG.info("采集日(run_date)=%s；实盘预测月=%s；as_of=%s（gap=%d天，与采集月是否=目标月无关）",
              run_date.date(), target_month.date(), as_of_live.date(), cfg.asof_gap_days)
+    # 稳健性告警：仅靠表推断采集日，若表内混入杂散未来日期会把 run_date 带偏。gap 常规约
+    # 0-45 天；异常时提示检查（不改行为，可用 cfg.run_date 显式覆盖）。
+    if not (-5 <= cfg.asof_gap_days <= 45):
+        LOG.warning("as_of 间隔 gap=%d 天偏离常规(约0-45天)：请检查汇总表是否含异常/未来日期，"
+                    "或用 Config.run_date 显式指定采集日。", cfg.asof_gap_days)
 
     # 2) 组装上下文
     aligner = FrequencyAligner(cfg, raw, indicators)
