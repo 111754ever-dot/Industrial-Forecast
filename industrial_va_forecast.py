@@ -97,15 +97,15 @@ class Config:
     # ---- 输出 ----
     out_dir: str = "output"
 
-    # ---- 真实时点口径（预测时点不写死，按汇总表数据自动推断）----
-    # 业务：每月不固定的某天(大概率20-25号)收集最新汇总表后预测【下一个未发布月】。
-    # 预测时点 as_of 不固定为某号，而是【按汇总表自身的数据新鲜度自动确定】：
-    #   run_date = 各 sheet 最新观测日期的最大值(=实际采集日)；asof_day = run_date.day。
-    # 于是预测月T的 as_of = T 当月的 asof_day 号；因 T=采集当月，该 as_of 即 run_date 本身，
-    # 回测各历史月也用同一 asof_day，随采集时间自动平移、不写死。
-    # run_date / asof_day_of_month 为 None 时自动从数据推断；亦可显式覆盖。
+    # ---- 真实时点口径（预测时点不写死，按汇总表采集日自动确定）----
+    # 业务：每月不固定的某天收集最新汇总表后预测【下一个未发布月】。
+    #   run_date  = 各 sheet 最新观测日期的最大值(=实际采集日)；
+    #   asof_gap_days = run_date − 目标月起点 的天数(采集时点相对目标月的位置)。
+    # 预测月 T 的 as_of = T 月起点 + asof_gap_days。对实盘目标月，该 as_of 恰等于 run_date，
+    # 【与采集月是否等于目标月无关】(例:6月5日预测5月, gap=35, as_of=6月5日, 正确)。
+    # 回测各历史月用同一 gap，随采集时间自动平移、不写死。None 时自动从数据推断。
     run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
-    asof_day_of_month: Optional[int] = None  # None=自动取 run_date.day
+    asof_gap_days: Optional[int] = None     # None=自动取 run_date−目标月起点；由 main() 解析
     # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
     pub_lag_month_days: int = 16     # 月度宏观发布滞后（社零/投资 15-17日；PPI~9日；PMI月末）
@@ -1087,7 +1087,7 @@ class Context:
     def realtime_feature_matrix(self) -> pd.DataFrame:
         """【真实时点(vintage)特征矩阵】——修复 ARX/LGB 训练与预测信息集不一致。
 
-        每一行 m 都用"在 m 月 asof_day_of_month 号能看到的数据"构造(panel@as_of_m)：
+        每一行 m 都用"在 as_of(m)=m月起点+asof_gap_days 能看到的数据"构造(panel@as_of_m)：
           - 当月 m 高频=残月(到约19日)、月度宏观当月值=未发布(NaN)；
           - 过去月份 m-1, m-2…=完整可见；目标滞后=已发布部分。
         于是【训练行与预测行具有完全相同的可得性结构】，杜绝"训练用完整月、预测用残月"
@@ -1110,26 +1110,8 @@ class Context:
         # 关键：特征保持 vintage，但【标签 __target__ 必须用已实现的真实目标值】
         # (vintage 行的当月目标未发布=NaN，不能当训练标签；其余 y 滞后特征仍是 vintage)
         rt["__target__"] = full["IVA_yoy"].reindex(rt.index)
-
-        # 实盘修正：对【尚无已实现目标的当月/未来月】，用【全表(无pub_lag)】重建其特征行。
-        # 理由：自动更新表"出现即可得"，实盘不应再按假定发布滞后删除表中已存在的数据；
-        # pub_lag 只用于历史回测重建可得性。训练行(历史已实现)仍按 vintage 不变。
-        last_real = rt.index[rt["__target__"].notna()]
-        if len(last_real):
-            cutoff = last_real.max()
-            live_rows = rt.index[rt.index > cutoff]
-            if len(live_rows):
-                collection = infer_collection_date(self.aligner.raw)
-                panel_full = FrequencyAligner.build_monthly_panel(
-                    self.aligner, collection, apply_pub_lag=False)
-                feat_full = self.fb.build(panel_full)
-                feat_cols = [c for c in rt.columns if c != "__target__"
-                             and c in feat_full.columns]
-                for m in live_rows:
-                    if m in feat_full.index:
-                        rt.loc[m, feat_cols] = feat_full.loc[m, feat_cols]
-                LOG.info("实盘行已用全表(无pub_lag)重建：%s", [str(x.date()) for x in live_rows])
-
+        # 注：实盘目标月那一行的特征，由 main() 预置在 _panel_cache 的【全表(无pub_lag)面板】
+        # 提供——因 as_of(目标月)==run_date 命中该缓存，故实盘行天然用"表中已可得数据"。
         self._rt_feat = rt
         LOG.info("已构建真实时点(vintage)特征矩阵：%s", rt.shape)
         return self._rt_feat
@@ -1165,26 +1147,31 @@ def infer_collection_date(raw: dict) -> pd.Timestamp:
     return pd.Timestamp(mx)
 
 
-def resolve_asof_day(cfg: Config, raw: dict) -> int:
-    """确定 as_of 的"当月第几天"：优先用 cfg 显式值，否则取采集日(run_date)的 day。"""
-    if cfg.asof_day_of_month is not None:
-        return int(cfg.asof_day_of_month)
-    run = pd.Timestamp(cfg.run_date) if cfg.run_date else infer_collection_date(raw)
-    return int(run.day)
+def resolve_asof_gap(cfg: Config, raw: dict, target_live: pd.Timestamp) -> int:
+    """确定 as_of 的间隔天数 = 采集日(run_date) − 目标月起点。
+
+    用"间隔"而非"当月第几天"，可正确处理"采集月≠目标月"(如6月5日预测5月)：
+    此时 gap = 35 天，as_of(5月) = 5月起点+35 = 6月5日 = 真实采集日。
+    """
+    if cfg.asof_gap_days is not None:
+        return int(cfg.asof_gap_days)
+    run = (pd.Timestamp(cfg.run_date) if cfg.run_date
+           else infer_collection_date(raw)).normalize()
+    start = pd.Timestamp(target_live.year, target_live.month, 1)
+    return int((run - start).days)
 
 
 def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
-    """预测月 T 的评估时点 = T 当月的 asof_day 号。
+    """预测月 T 的评估时点 = T 月起点 + asof_gap_days（采集时点相对目标月的位置）。
 
-    asof_day 不写死：由 main() 在加载数据后调用 resolve_asof_day() 按【汇总表采集日】
-    自动确定并写回 cfg.asof_day_of_month，随采集时间自动平移。若未解析(独立调用)则回退 23。
-    业务含义：此时 T 的高频已覆盖约 2/3 个月(残月)，目标与月度宏观对 T 尚不可见、对 T-1
-    可见。回测与实盘使用同一规则，杜绝前视偏差。
+    asof_gap_days 不写死：由 main() 按【采集日 − 实盘目标月起点】解析并写回 cfg，随采集
+    时间自动平移；对实盘目标月该 as_of 恰为 run_date(与采集月是否等于目标月无关)。
+    若未解析(独立调用)回退 gap=22(≈当月23号)。回测与实盘同一规则，杜绝前视偏差。
     """
     tm = month_end(target_month)
-    day = cfg.asof_day_of_month if cfg.asof_day_of_month is not None else 23
-    day = min(int(day), tm.day)
-    return pd.Timestamp(year=tm.year, month=tm.month, day=day)
+    gap = cfg.asof_gap_days if cfg.asof_gap_days is not None else 22
+    start = pd.Timestamp(tm.year, tm.month, 1)
+    return start + pd.Timedelta(days=int(gap))
 
 
 def true_target_value(raw: dict, cfg: Config, target_month: pd.Timestamp) -> Optional[float]:
@@ -1768,17 +1755,25 @@ def main(cfg: Config = CFG):
     loader = DataLoader(cfg, indicators)
     raw = loader.load()
 
-    # 1b) 预测时点不写死：按汇总表采集日自动确定 as_of 的"当月第几天"
-    run_date = pd.Timestamp(cfg.run_date) if cfg.run_date else infer_collection_date(raw)
-    cfg.asof_day_of_month = resolve_asof_day(cfg, raw)
-    LOG.info("汇总表采集日(run_date)=%s -> as_of 取当月第 %d 天(随采集自动平移，未写死)",
-             run_date.date(), cfg.asof_day_of_month)
+    # 1b) 预测时点不写死：按采集日与目标月起点的间隔(gap)确定 as_of，使实盘 as_of==采集日
+    run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
+                else infer_collection_date(raw)).normalize()
+    target_month = detect_target_month(raw, cfg)
+    cfg.asof_gap_days = resolve_asof_gap(cfg, raw, target_month)
+    as_of_live = asof_for_target(cfg, target_month)   # == run_date（按构造）
+    LOG.info("采集日(run_date)=%s；实盘预测月=%s；as_of=%s（gap=%d天，与采集月是否=目标月无关）",
+             run_date.date(), target_month.date(), as_of_live.date(), cfg.asof_gap_days)
 
     # 2) 组装上下文
     aligner = FrequencyAligner(cfg, raw, indicators)
     fb = FeatureBuilder(cfg)
     ctx = Context(cfg, aligner, fb)
     _wire_context_cache(ctx)
+
+    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/LocalLevel/
+    #     DFM/ARX/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
+    ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
+        aligner, as_of_live, apply_pub_lag=False)
 
     # 3) 模型集合
     # 核心模型：AR(基准) + LocalLevel(朴素地板) + ARX(锚定高频桥接)
@@ -1823,11 +1818,8 @@ def main(cfg: Config = CFG):
             os.path.join(cfg.out_dir, "dm_test_vs_benchmark.csv"),
             index=False, encoding="utf-8-sig")
 
-    # 7) 实盘预测：下一个未发布月
-    target_month = detect_target_month(raw, cfg)
-    as_of = asof_for_target(cfg, target_month)
-    LOG.info("预测月 = %s ；评估时点 as_of = %s",
-             target_month.date(), as_of.date())
+    # 7) 实盘预测：下一个未发布月（target_month / as_of_live 已在 1b 解析）
+    as_of = as_of_live
 
     per_model = {}
     for mdl in models:
