@@ -1138,12 +1138,25 @@ def _wire_context_cache(ctx: Context):
 # 第 10 节  真实时点工具：由"预测月"推出 as_of
 # ==============================================================================
 def infer_collection_date(raw: dict) -> pd.Timestamp:
-    """从汇总表推断采集日 = 各 sheet 最新观测日期的最大值(数据新鲜度)。"""
+    """从汇总表推断采集日 = 各 sheet【有实际数据的行】的最新日期的最大值。
+
+    稳健性：只取"至少有一个指标值非空"的行的日期，**忽略预生成的未来空日期行**
+    （仅有日期、指标值全空）。否则空尾行会把采集日带偏、使预测时点提前/错位。
+    """
     mx = None
     for df in raw.values():
-        if "date" in df.columns and len(df):
-            d = pd.to_datetime(df["date"]).max()
-            mx = d if mx is None else max(mx, d)
+        if "date" not in df.columns or len(df) == 0:
+            continue
+        value_cols = [c for c in df.columns if c != "date"]
+        if not value_cols:
+            continue
+        has_data = df[value_cols].notna().any(axis=1)   # 该行是否有任一指标值
+        if not has_data.any():
+            continue
+        d = pd.to_datetime(df.loc[has_data, "date"]).max()
+        mx = d if mx is None else max(mx, d)
+    if mx is None:
+        raise RuntimeError("无法从汇总表推断采集日：所有 sheet 均无非空指标值。")
     return pd.Timestamp(mx)
 
 
