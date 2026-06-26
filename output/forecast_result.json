@@ -1,14 +1,14 @@
 {
   "target_month": "2026-05-31",
-  "point_forecast": 4.44,
-  "lower_80": 2.674,
-  "upper_80": 6.205,
-  "lower_95": 2.211,
-  "upper_95": 6.668,
+  "point_forecast": 4.412,
+  "lower_80": 2.616,
+  "upper_80": 6.208,
+  "lower_95": 2.188,
+  "upper_95": 6.636,
   "per_model": {
     "AR": 4.757,
     "LocalLevel": 5.2,
-    "ARX": 4.113
+    "ARX": 4.057
   },
   "top_drivers": {
     "ensemble_composition": [
@@ -16,13 +16,13 @@
         "model": "AR",
         "weight": 0.507,
         "point": 4.757,
-        "weighted_contribution": 2.412
+        "weighted_contribution": 2.411
       },
       {
         "model": "ARX",
         "weight": 0.493,
-        "point": 4.113,
-        "weighted_contribution": 2.028
+        "point": 4.057,
+        "weighted_contribution": 2.001
       }
     ],
     "feature_drivers": [
@@ -32,43 +32,43 @@
         "top_features": [
           {
             "feature": "arlag3",
-            "coef": 0.763
+            "coef": 0.79
           },
           {
             "feature": "retail_yoy_l1",
-            "coef": 0.714
+            "coef": 0.749
           },
           {
             "feature": "arlag1",
-            "coef": 0.619
+            "coef": 0.606
           },
           {
             "feature": "reinv_cum_l1",
-            "coef": 0.411
-          },
-          {
-            "feature": "arlag2",
-            "coef": 0.36
+            "coef": 0.405
           },
           {
             "feature": "util_tire_semi_l2",
-            "coef": 0.343
+            "coef": 0.358
+          },
+          {
+            "feature": "arlag2",
+            "coef": 0.355
           },
           {
             "feature": "steel_crude_key_t0",
-            "coef": 0.32
+            "coef": 0.345
           },
           {
             "feature": "pmi_newexport_l2",
-            "coef": -0.247
-          },
-          {
-            "feature": "port_cfd_t0",
-            "coef": 0.183
+            "coef": -0.252
           },
           {
             "feature": "retail_yoy_l2",
-            "coef": -0.18
+            "coef": -0.181
+          },
+          {
+            "feature": "retail_yoy_l3",
+            "coef": -0.173
           }
         ]
       }

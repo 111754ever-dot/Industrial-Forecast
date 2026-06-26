@@ -106,9 +106,12 @@ class Config:
     # run_date / asof_day_of_month 为 None 时自动从数据推断；亦可显式覆盖。
     run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
     asof_day_of_month: Optional[int] = None  # None=自动取 run_date.day
+    # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
     pub_lag_month_days: int = 16     # 月度宏观发布滞后（社零/投资 15-17日；PPI~9日；PMI月末）
-    pub_lag_highfreq_days: int = 4   # 高频发布滞后（日~1天/周~3-5天/旬~5天 的折中）
+    pub_lag_day_days: int = 1        # 日度发布滞后（BDI/价格/港口吞吐/商品房，基本当天-次日）
+    pub_lag_week_days: int = 4       # 周度发布滞后（开工率/煤耗/乘用车，~3-5天）
+    pub_lag_tenday_days: int = 6     # 旬度发布滞后（中钢协钢铁旬报，~5-7天）
 
     # ---- 回测 ----
     backtest_months: int = 48        # 回测的外推月数（从最近往前）。生产可调大。
@@ -490,11 +493,18 @@ class FrequencyAligner:
             self._series[ind.key] = s
 
     def _pub_lag_days(self, ind: Indicator) -> int:
+        cfg = self.cfg
         if ind.role == "target":
-            return self.cfg.pub_lag_target_days
-        if ind.sheet == self.cfg.sheet_month:
-            return self.cfg.pub_lag_month_days
-        return self.cfg.pub_lag_highfreq_days
+            return cfg.pub_lag_target_days
+        if ind.sheet == cfg.sheet_month:
+            return cfg.pub_lag_month_days
+        if ind.sheet == cfg.sheet_day:
+            return cfg.pub_lag_day_days
+        if ind.sheet == cfg.sheet_week:
+            return cfg.pub_lag_week_days
+        if ind.sheet == cfg.sheet_tenday:
+            return cfg.pub_lag_tenday_days
+        return cfg.pub_lag_week_days   # 兜底
 
     def _visible_raw(self, ind: Indicator, as_of: pd.Timestamp) -> pd.Series:
         """返回 as_of 时点可见的原始序列（参考期末 + 发布滞后 <= as_of）。"""
