@@ -1126,22 +1126,39 @@ class ModelMFDFM(BaseModel):
         self.cfg = cfg
         self._params = None          # 缓存的 EM 参数
         self._anchor_month = None    # 上次重估参数的目标月（按 refit 周期复用）
+        self._param_cols = None      # 上次重估时的列签名（列集变化则不可复用参数）
 
     def _factor(self, as_of, target_month, ctx):
-        """提取核心序列(含目标)的单一【滤波】共同因子序列(实时正确：每月仅用≤该月数据)。"""
+        """提取核心序列(含目标)的单一【滤波】共同因子序列(实时正确：每月仅用≤该月数据)。
+
+        健壮性：DynamicFactorMQ(standardize=True) 会按各列在可见窗口的 std 标准化——若某列
+        在该 vintage 窗口里观测过少或近零方差，标准化会产生 inf/NaN 使 EM 报错。故先清洗
+        inf、剔除"观测<36 或近零方差"的列；并按列签名缓存参数(列集变化时强制重估，避免用
+        旧参数滤波维度不符的新模型)。
+        """
         from statsmodels.tsa.statespace.dynamic_factor_mq import DynamicFactorMQ
         cfg = self.cfg
         panel = ctx.aligner.build_monthly_panel(as_of)   # vintage：当月IAV=NaN, 高频=残月
         cols = ["IVA_yoy"] + [c for c in cfg.dfm_core_series if c in panel.columns]
         X = panel.loc[panel.index <= month_end(target_month), cols].copy()
+        X = X.replace([np.inf, -np.inf], np.nan)
         X = X.loc[X.dropna(how="all").index.min():]
-        if len(X) < 72:
+        # 剔除可见窗口内观测过少 / 近零方差的列（否则标准化->inf/NaN，EM 失败）。目标列恒留。
+        keep = [c for c in X.columns
+                if c == "IVA_yoy"
+                or (X[c].notna().sum() >= 36 and X[c].std(skipna=True) > 1e-8)]
+        X = X[keep]
+        if "IVA_yoy" not in X.columns or X.shape[1] < 3 or len(X) < 72:
             return None
+        # 主路径：状态空间 Kalman 因子。EM 偶发数值不稳定(optimizer 进入非有限区)时，
+        # 降级为 PCA 因子(有限、实时安全)，保证不丢该月、不打印告警。
         try:
             mod = DynamicFactorMQ(X, factors=1, factor_orders=1,
                                   idiosyncratic_ar1=True, standardize=True)
+            sig = tuple(X.columns)   # 列签名：与缓存参数的列集一致才可复用
             ai = self._anchor_month
             reuse = (self._params is not None and ai is not None
+                     and self._param_cols == sig
                      and 0 <= (target_month.to_period("M") - ai.to_period("M")).n
                      < cfg.dfm_refit_every)
             if reuse:
@@ -1149,20 +1166,43 @@ class ModelMFDFM(BaseModel):
                     res = mod.smooth(self._params)
                 except Exception:
                     res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
-                    self._params, self._anchor_month = res.params, target_month
+                    self._params, self._anchor_month, self._param_cols = \
+                        res.params, target_month, sig
             else:
                 res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
-                self._params, self._anchor_month = res.params, target_month
+                self._params, self._anchor_month, self._param_cols = \
+                    res.params, target_month, sig
             # 提取共同因子序列：不同 statsmodels 版本属性名不同，做兼容回退。
             # states.smoothed 为 Kalman 平滑因子(仅用≤as_of数据，实时安全)。
             if hasattr(res, "factors_filtered"):
                 fac = np.asarray(res.factors_filtered.iloc[:, 0])
             else:
                 fac = np.asarray(res.states.smoothed.iloc[:, 0])
-            return pd.Series(fac, index=X.index)
+            if np.all(np.isfinite(fac)):
+                return pd.Series(fac, index=X.index)
         except Exception as e:
-            LOG.warning("MF-DFM 因子提取在 %s 失败：%s", target_month.date(), e)
-            return None
+            LOG.debug("MF-DFM EM 在 %s 数值不稳定，降级为PCA因子：%s", target_month.date(), e)
+        return self._pca_factor(X)
+
+    @staticmethod
+    def _pca_factor(X: pd.DataFrame) -> Optional[pd.Series]:
+        """降级因子：核心面板按列标准化(均值/标准差)+均值填补后取第一主成分。
+
+        作为 EM 数值不稳定时的兜底——产出有限、仅用窗口内(≤as_of)数据，实时安全；后续锚定
+        Ridge 回归会吸收其符号/尺度，故与 Kalman 因子可无缝替换。
+        """
+        from sklearn.decomposition import PCA
+        Z = X.replace([np.inf, -np.inf], np.nan).astype(float)
+        sd = Z.std(ddof=0).replace(0.0, np.nan)
+        Z = (Z - Z.mean()) / sd
+        Z = Z.fillna(0.0).replace([np.inf, -np.inf], 0.0)   # 标准化后缺失=均值=0
+        try:
+            f = PCA(n_components=1).fit_transform(Z.values).ravel()
+            if np.all(np.isfinite(f)):
+                return pd.Series(f, index=X.index)
+        except Exception:
+            pass
+        return None
 
     def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
         from sklearn.linear_model import RidgeCV
