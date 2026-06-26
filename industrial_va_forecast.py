@@ -26,7 +26,7 @@
   多样性；门控按 Diebold-Mariano 检验"是否显著差于基准"决定进组合）：
     - AR(p)        ：单变量自回归（基准/锚），BIC 定阶；
     - ARX          ：AR 滞后 + 高频外生（弹性网, 时序CV），线性桥接；
-    - FA-AR        ：因子增广自回归 / 扩散指数（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson；
+    - DI           ：扩散指数 / 因子增广回归（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson 2002；
     - LightGBM(可选)：锚定 + 梯度提升残差（非线性），回测显著差于AR，默认关，作交叉验证参考。
   说明：经无泄漏回测 + DM 检验，在"当月同比/累计同比"口径下高频指标对 AR 无显著增量；故三个
   核心模型都锚定 AR、仅让高频/因子作受限边际修正，彼此印证、机制互补。
@@ -134,7 +134,7 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 核心(默认运行、进DM门控组合): AR + ARX + FA-AR（三类机制各一，均锚定AR）。
+    # 核心(默认运行、进DM门控组合): AR + ARX + DI（三类机制各一，均锚定AR）。
     # 可选(默认关闭): LightGBM(锚定+GBM残差,非线性)——回测显著差于AR,开启后作交叉验证参考。
     enable_probe_models: bool = False
 
@@ -698,10 +698,10 @@ class BaseModel:
 
 
 # ------------------------------------------------------------------------------
-# 8.1  FA-AR（因子增广自回归 / 扩散指数，Stock-Watson 2002）
+# 8.1  DI（扩散指数 / 因子增广回归，Stock-Watson 2002）
 # ------------------------------------------------------------------------------
-class ModelFAAR(BaseModel):
-    """因子增广自回归(FA-AR / 扩散指数)：非1-2月目标 ~ AR滞后 + 高频指标的【主成分因子(PCA)】，
+class ModelDI(BaseModel):
+    """扩散指数(Diffusion Index, Stock-Watson 2002) / 因子增广回归：非1-2月目标 ~ AR滞后 + 高频指标的【主成分因子(PCA)】，
     岭回归(TimeSeriesSplit 定参，无泄漏)。
 
     设计要点（解决纯高频/原DFM"系统高估"的问题）：
@@ -710,7 +710,7 @@ class ModelFAAR(BaseModel):
         学多样性，是公认的 Stock-Watson 扩散指数预测法；
       - 1-2月退化为近期均值。
     """
-    name = "FA-AR"
+    name = "DI"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -758,7 +758,7 @@ class ModelFAAR(BaseModel):
             _gauss_interval(out, point, sigma, cfg)
             return out
         except Exception as e:
-            LOG.warning("FA-AR 在 %s 失败：%s", target_month.date(), e)
+            LOG.warning("DI 在 %s 失败：%s", target_month.date(), e)
             return None
 # ------------------------------------------------------------------------------
 # 8.3  LightGBM（锚定 + 梯度提升残差，非线性混合）
@@ -1515,7 +1515,7 @@ class Reporter:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
         styles = {"AR": ("#1f77b4", "-"), "ARX": ("#d62728", "--"),
-                  "FA-AR": ("#9467bd", "-."),
+                  "DI": ("#9467bd", "-."),
                   "LightGBM": ("#2ca02c", "-."), "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
@@ -1656,7 +1656,7 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
             "point": round(float(pm.point), 3),
             "weighted_contribution": round(float(w) * float(pm.point), 3)})
 
-    # 三个核心模型(AR/ARX/FA-AR)均锚定 AR 惯性，故预测主要由自身历史惯性决定
+    # 三个核心模型(AR/ARX/DI)均锚定 AR 惯性，故预测主要由自身历史惯性决定
     if cfg.benchmark_name in weights:
         out["note"] = (
             f"组合由 {('/'.join(weights.keys()))} 构成(权重 "
@@ -1733,12 +1733,12 @@ def main(cfg: Config = CFG):
         aligner, as_of_live, apply_pub_lag=False)
 
     # 3) 模型集合 —— 三类机制各一，均锚定 AR 惯性、避免高频高估，提供方法学多样性：
-    #    AR(单变量惯性) + ARX(线性高频桥接) + FA-AR(因子增广/扩散指数)。门控按"是否显著差于
+    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(扩散指数/因子模型)。门控按"是否显著差于
     #    基准"决定进组合。
     models = [
         ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
         ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
-        ModelFAAR(cfg),          # 因子增广AR / 扩散指数（AR滞后 + 高频PCA因子, 岭回归）
+        ModelDI(cfg),            # 扩散指数/因子模型（AR滞后 + 高频PCA因子, 岭回归, Stock-Watson）
     ]
     # 可选交叉验证模型（默认关闭）：非线性混合（锚定+GBM残差），回测显著差于AR，作参考。
     if cfg.enable_probe_models:
