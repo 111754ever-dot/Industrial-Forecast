@@ -117,7 +117,9 @@ class Config:
     asof_gap_days: Optional[int] = None     # None=自动取 run_date−目标月起点；由 main() 解析
     # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
-    pub_lag_month_days: int = 16     # 月度宏观发布滞后（社零/投资 15-17日；PPI~9日；PMI月末）
+    pub_lag_month_days: int = 16     # 月度宏观【默认】发布滞后（社零/投资/发电/产量 15-17日）。
+    #   注：发布更早的月度指标用 Indicator.pub_lag_days 单独覆盖，不走此默认：
+    #   PMI 家族=1天(NBS月末即发布)、PPI/PPIRM=9天(约次月9-10日)。详见指标字典。
     pub_lag_day_days: int = 1        # 日度发布滞后（BDI/价格/港口吞吐/商品房，基本当天-次日）
     pub_lag_week_days: int = 4       # 周度发布滞后（开工率/煤耗/乘用车，~3-5天）
     pub_lag_tenday_days: int = 6     # 旬度发布滞后（中钢协钢铁旬报，~5-7天）
@@ -200,6 +202,9 @@ CFG = Config()
 #   dfm_tier : 是否纳入 MF-DFM 的"长且完整"核心集合（很新/很稀疏的剔除，仅供 ML）
 #   role     : 'target' / 'predictor'
 #   note     : 备注（重点标注易混项）
+#   pub_lag_days : 该指标的【真实发布滞后(天)】覆盖；None=用所属 sheet 的默认滞后。
+#                  用于个别"比同 sheet 默认更早可得"的指标(如 PMI 月末即发布、PPI 约次月9日)，
+#                  使回测可见性贴近真实历史可得性，并对预测时点变化(早/晚于常规)保持正确。
 # ------------------------------------------------------------------------------
 @dataclass
 class Indicator:
@@ -211,6 +216,7 @@ class Indicator:
     dfm_tier: bool = True
     role: str = "predictor"
     note: str = ""
+    pub_lag_days: Optional[int] = None
 
 
 def build_indicator_dict(cfg: Config) -> list[Indicator]:
@@ -232,18 +238,20 @@ def build_indicator_dict(cfg: Config) -> list[Indicator]:
         Indicator("reinv_cum", "中国:房地产开发投资完成额:累计值", M,
                   "cum2mom2yoy", "last", True, "predictor",
                   "累计值(YTD)：同上还原；与固投累计值是两条近名指标，勿混"),
-        Indicator("pmi", "中国:制造业PMI", M, "rate", "last", True, "predictor", "荣枯线50"),
+        Indicator("pmi", "中国:制造业PMI", M, "rate", "last", True, "predictor",
+                  "荣枯线50；NBS当月末即发布，滞后≈1天(非16)", pub_lag_days=1),
         Indicator("pmi_neworder", "中国:制造业PMI:新订单", M, "rate", "last", True, "predictor",
-                  "PMI 子项-新订单，勿与下面新出口订单混"),
+                  "PMI 子项-新订单，勿与下面新出口订单混；随PMI月末发布", pub_lag_days=1),
         Indicator("pmi_newexport", "中国:制造业PMI:新出口订单", M, "rate", "last", True, "predictor",
-                  "PMI 子项-新出口订单"),
+                  "PMI 子项-新出口订单；随PMI月末发布", pub_lag_days=1),
         Indicator("power_yoy", "中国:发电量:当月同比", M, "yoy_keep", "last", True, "predictor",
                   "发电量当月同比，与工业生产高度同步"),
-        Indicator("ppi_yoy", "中国:PPI:当月同比", M, "yoy_keep", "last", True, "predictor", ""),
+        Indicator("ppi_yoy", "中国:PPI:当月同比", M, "yoy_keep", "last", True, "predictor",
+                  "NBS约次月9-10日发布，滞后≈9天(早于社零/投资)", pub_lag_days=9),
         Indicator("ppirm_yoy", "中国:PPIRM:当月同比", M, "yoy_keep", "last", True, "predictor",
-                  "PPIRM(生产资料购进价)，勿与 PPI 混"),
+                  "PPIRM(生产资料购进价)，勿与 PPI 混；随PPI约次月9日发布", pub_lag_days=9),
         Indicator("pmi_rawprice", "中国:制造业PMI:主要原材料购进价格", M, "rate", "last", True,
-                  "predictor", "PMI 价格子项"),
+                  "predictor", "PMI 价格子项；随PMI月末发布", pub_lag_days=1),
         Indicator("prod_ic", "中国:产量:集成电路:当月值", M, "level2yoy", "last", True, "predictor",
                   "当月值水平量 -> 同比"),
         Indicator("prod_power_equip", "中国:产量:发电设备:当月值", M, "level2yoy", "last", True,
@@ -514,6 +522,9 @@ class FrequencyAligner:
 
     def _pub_lag_days(self, ind: Indicator) -> int:
         cfg = self.cfg
+        # 个别指标的真实滞后与所属 sheet 默认不同 -> 用指标级覆盖(如 PMI 月末即发布)。
+        if ind.pub_lag_days is not None:
+            return int(ind.pub_lag_days)
         if ind.role == "target":
             return cfg.pub_lag_target_days
         if ind.sheet == cfg.sheet_month:

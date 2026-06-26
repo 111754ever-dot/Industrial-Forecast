@@ -3,13 +3,13 @@ IVA_yoy,中国:工业增加值:规模以上工业企业:当月同比(1-2月拆�
 retail_yoy,中国:社会消费品零售总额:当月同比(1-2月合并),月度,yoy_keep,True,predictor,1-2月【合并】口径；与目标拆分口径不同，1/2月对齐需谨慎
 fai_cum,中国:固定资产投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：先还原当月值再算当月同比；勿当水平值；1月空、2月为1-2合并
 reinv_cum,中国:房地产开发投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：同上还原；与固投累计值是两条近名指标，勿混
-pmi,中国:制造业PMI,月度,rate,True,predictor,荣枯线50
-pmi_neworder,中国:制造业PMI:新订单,月度,rate,True,predictor,PMI 子项-新订单，勿与下面新出口订单混
-pmi_newexport,中国:制造业PMI:新出口订单,月度,rate,True,predictor,PMI 子项-新出口订单
+pmi,中国:制造业PMI,月度,rate,True,predictor,荣枯线50；NBS当月末即发布，滞后≈1天(非16)
+pmi_neworder,中国:制造业PMI:新订单,月度,rate,True,predictor,PMI 子项-新订单，勿与下面新出口订单混；随PMI月末发布
+pmi_newexport,中国:制造业PMI:新出口订单,月度,rate,True,predictor,PMI 子项-新出口订单；随PMI月末发布
 power_yoy,中国:发电量:当月同比,月度,yoy_keep,True,predictor,发电量当月同比，与工业生产高度同步
-ppi_yoy,中国:PPI:当月同比,月度,yoy_keep,True,predictor,
-ppirm_yoy,中国:PPIRM:当月同比,月度,yoy_keep,True,predictor,PPIRM(生产资料购进价)，勿与 PPI 混
-pmi_rawprice,中国:制造业PMI:主要原材料购进价格,月度,rate,True,predictor,PMI 价格子项
+ppi_yoy,中国:PPI:当月同比,月度,yoy_keep,True,predictor,NBS约次月9-10日发布，滞后≈9天(早于社零/投资)
+ppirm_yoy,中国:PPIRM:当月同比,月度,yoy_keep,True,predictor,PPIRM(生产资料购进价)，勿与 PPI 混；随PPI约次月9日发布
+pmi_rawprice,中国:制造业PMI:主要原材料购进价格,月度,rate,True,predictor,PMI 价格子项；随PMI月末发布
 prod_ic,中国:产量:集成电路:当月值,月度,level2yoy,True,predictor,当月值水平量 -> 同比
 prod_power_equip,中国:产量:发电设备:当月值,月度,level2yoy,True,predictor,当月值水平量 -> 同比
 steel_crude_key,中国:日均产量:粗钢:重点企业,旬度,level2yoy,True,predictor,重点企业粗钢日均产量；勿与下面'预估日均产量:粗钢'混
