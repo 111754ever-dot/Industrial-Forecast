@@ -6,35 +6,35 @@
   "lower_95": 2.144,
   "upper_95": 7.116,
   "per_model": {
-    "AR": 4.757,
-    "ARX": 4.021,
-    "DI": 4.325,
+    "Autoregression": 4.757,
+    "ElasticNet": 4.021,
+    "DiffusionIndex": 4.325,
     "LightGBM": 4.833,
-    "PLS": 5.485,
-    "MFDFM": 4.987
+    "PartialLeastSquares": 5.485,
+    "DynamicFactorModel": 4.987
   },
   "top_drivers": {
     "ensemble_composition": [
       {
-        "model": "AR",
+        "model": "Autoregression",
         "weight": 0.205,
         "point": 4.757,
         "weighted_contribution": 0.977
       },
       {
-        "model": "MFDFM",
+        "model": "DynamicFactorModel",
         "weight": 0.202,
         "point": 4.987,
         "weighted_contribution": 1.009
       },
       {
-        "model": "ARX",
+        "model": "ElasticNet",
         "weight": 0.2,
         "point": 4.021,
         "weighted_contribution": 0.804
       },
       {
-        "model": "DI",
+        "model": "DiffusionIndex",
         "weight": 0.19,
         "point": 4.325,
         "weighted_contribution": 0.824
@@ -46,7 +46,7 @@
         "weighted_contribution": 0.674
       },
       {
-        "model": "PLS",
+        "model": "PartialLeastSquares",
         "weight": 0.062,
         "point": 5.485,
         "weighted_contribution": 0.343
@@ -54,7 +54,7 @@
     ],
     "feature_drivers": [
       {
-        "model": "ARX",
+        "model": "ElasticNet",
         "weight": 0.2,
         "top_features": [
           {
@@ -146,6 +146,6 @@
         ]
       }
     ],
-    "note": "组合由 AR/ARX/DI/LightGBM/PLS/MFDFM 构成(权重 AR=0.21, ARX=0.20, DI=0.19, LightGBM=0.14, PLS=0.06, MFDFM=0.20)。其中 AR/ARX/DI/LightGBM/MFDFM 均【锚定 AR 惯性】，预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正（经 DM 检验高频对 AR 无显著增量）；PLS 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
+    "note": "组合由 Autoregression/ElasticNet/DiffusionIndex/LightGBM/PartialLeastSquares/DynamicFactorModel 构成(权重 Autoregression=0.21, ElasticNet=0.20, DiffusionIndex=0.19, LightGBM=0.14, PartialLeastSquares=0.06, DynamicFactorModel=0.20)。其中 Autoregression/ElasticNet/DiffusionIndex/LightGBM/DynamicFactorModel 均【锚定 AR 惯性】，预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正（经 DM 检验高频对 AR 无显著增量）；PartialLeastSquares 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
   }
 }

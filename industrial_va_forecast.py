@@ -24,19 +24,30 @@
   conformal)校准"，保证经验覆盖达标且不过窄。
 * 模型集合（六类机制并存，提供方法学多样性。多数成员【锚定 AR 惯性】以避免纯高频模型的
   系统性高估；组合提升的关键是【误差去相关】而非单体精度，故保留单体较弱但去相关的成员）：
-    - AR(p)        ：单变量自回归（基准/锚），BIC 定阶；
-    - ARX          ：AR 滞后 + 高频外生（弹性网, 时序CV），线性桥接；
-    - DI           ：扩散指数 / 因子增广回归（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson 2002；
-    - LightGBM     ：锚定 + 梯度提升残差（非线性）；
-    - PLS          ：纯当月高频桥接（偏最小二乘，【不锚 AR】），误差与其余模型仅~0.3相关，
-                     凭去相关改善组合；
-    - MFDFM        ：混频动态因子（DynamicFactorMQ 状态空间 Kalman 因子 + 锚定 AR 岭回归），
-                     发挥混频/ragged-edge 优势，单体回测最佳之一。
+    - Autoregression      ：单变量自回归 AR(p)（基准/锚），BIC 定阶；
+    - ElasticNet          ：自回归滞后 + 高频外生的弹性网回归（时序CV），线性桥接；
+    - DiffusionIndex      ：扩散指数 / 因子增广回归（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson 2002；
+    - LightGBM            ：锚定 + 梯度提升残差（非线性）；
+    - PartialLeastSquares ：纯当月高频桥接（偏最小二乘，【不锚自回归惯性】），误差与其余模型仅~0.3相关；
+    - DynamicFactorModel  ：混频动态因子（DynamicFactorMQ 状态空间 Kalman 因子 + 锚定AR岭回归），
+                            发挥混频/ragged-edge 优势，单体回测最佳之一。
+  另：1-2月口径单独处理——见下"1-2月合并"说明。
   门控：是否按 Diebold-Mariano 检验"显著差于基准"剔除成员由 cfg.ensemble_gate_models 控制；
-  默认 False（不剔除、全部纳入逆 MSE^2 加权），因逆误差加权本身即对弱模型软降权，且 PLS 这类
-  "单体弱但去相关"的成员不应被基于单体精度的门控误剔。设 True 可恢复基准门控。
-  说明：经无泄漏回测 + DM 检验，在"当月同比/累计同比"口径下高频指标对 AR 无显著增量；故多数
-  成员锚定 AR、仅让高频/因子作受限边际修正，彼此印证、机制互补。
+  默认 False（不剔除、全部纳入逆 MSE^2 加权），因逆误差加权本身即对弱模型软降权，且
+  PartialLeastSquares 这类"单体弱但去相关"的成员不应被基于单体精度的门控误剔。设 True 可恢复门控。
+  说明：经无泄漏回测 + DM 检验，高频指标对自回归基准无显著增量；故多数成员锚定自回归惯性、
+  仅让高频/因子作受限边际修正，彼此印证、机制互补。
+
+1-2 月口径（统一产出按目标月切换）
+--------------------------------
+国家统计局对工业增加值【不单独发布 1 月、2 月】，而是把 1-2 月合并、于 3 月中旬一起公布；
+"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统：
+  * 目标月 3-12 月：预测并显示【当月同比】（上面的六模型集合）；
+  * 目标月 1 月    ：不单独预测 1 月单月（无意义）；
+  * 目标月 2 月（即 1-2 月窗口）：改为预测【1-2 月累计同比(合并)】——经"标准方法竞赛
+    (RW/ARIMA/ETS/Theta)+高频桥接检验"实证，Theta 法在累计同比序列上最稳健且无可质疑，
+    故 1-2 月合并采用 Theta 法（statsmodels ThetaModel），区间为高斯(近年误差RMSE为σ)。
+    实现见 forecast_janfeb_combined()。
 
 真实时点（ragged edge）口径
 --------------------------
@@ -96,12 +107,14 @@ LOG = logging.getLogger("IVA")
 @dataclass
 class Config:
     # ---- 输入 ----
-    excel_path: str = "数据汇总表0620V3.xlsx"
+    excel_path: str = "数据汇总表0620V4.xlsx"
     sheet_target: str = "工业增加值"
     sheet_month: str = "月度"
     sheet_tenday: str = "旬度"
     sheet_week: str = "周度"
     sheet_day: str = "日度"
+    # 【累计同比】列名(在"工业增加值"sheet里，与当月同比并列)。仅用于 1-2 月口径(见下)。
+    ytd_col: str = "中国:工业增加值:规模以上工业企业:累计同比"
 
     # ---- 输出 ----
     out_dir: str = "output"
@@ -143,8 +156,9 @@ class Config:
     ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
 
     # ---- 模型集合 ----
-    # 组合集合: AR + ARX + DI + LightGBM + PLS（五类机制：自回归/线性高频桥接/PCA因子/
-    # 非线性/PLS纯高频桥接）。AR/ARX/DI 误差高度相关(0.87-0.97)，多样性已饱和；LightGBM
+    # 组合集合(当月同比口径): Autoregression + ElasticNet + DiffusionIndex + LightGBM +
+    # PartialLeastSquares + DynamicFactorModel。前三者误差高度相关(0.87-0.97)、多样性已饱和；
+    # 后三者(LightGBM
     # 与 PLS 提供去相关增量（PLS 不锚AR、误差仅0.3相关，凭去相关改善组合）。
     enable_probe_models: bool = True     # 纳入 LightGBM（锚定+GBM残差，非线性）
     enable_pls: bool = True              # 纳入 PLS（纯当月高频桥接, 不锚AR, 去相关多样性）
@@ -156,9 +170,16 @@ class Config:
                               "ppi_yoy", "retail_yoy", "prod_ic", "prod_power_equip",
                               "steel_crude_key", "steel_rolled_key", "car_wholesale")
 
+    # ---- 1-2 月口径(累计同比合并值, Theta 法) ----
+    # 国家统计局对 1、2 月工业增加值不单独发布、合并于 3 月中旬公布；拆分单月是人造噪声。
+    # 故目标月为 1 或 2 月时，改为预测【1-2 月累计同比(合并)】，模型用 Theta 法
+    # (statsmodels ThetaModel，作用于累计同比序列)——经"标准方法竞赛+高频桥接检验"实证为最稳健。
+    janfeb_break_years: tuple = (2020, 2021)  # 结构断裂年(COVID)：从区间校准残差中剔除，避免区间被极值撑爆
+    janfeb_calib_window: int = 12             # 区间校准只用最近 N 年残差(贴合当前增速regime，不被高增长期撑宽)
+
     # ---- 基准与"是否真有技能"门控 ----
     # 基准 = AR(p)：平稳自相关序列的标准技能下限(比"近期均值"更严格、更规范)。
-    benchmark_name: str = "AR"
+    benchmark_name: str = "Autoregression"
     # 基准门控开关：True=仅"不显著差于基准"的模型进组合(剔除显著更差者)；
     # False=【不剔除任何模型】，全部成员纳入逆MSE^2加权(DM 仍计算并报告，仅不据此剔除)。
     # 默认 False：逆误差加权本身即对弱模型软降权，且"单体弱但去相关"的成员(如PLS)不应被
@@ -740,7 +761,7 @@ class ModelDI(BaseModel):
         学多样性，是公认的 Stock-Watson 扩散指数预测法；
       - 1-2月退化为近期均值。
     """
-    name = "DI"
+    name = "DiffusionIndex"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -947,7 +968,7 @@ class ModelAR(BaseModel):
     比"近期均值"更标准、更严格的基准：显式建模惯性/均值回复。
     1-2月退化为近期均值。
     """
-    name = "AR"
+    name = "Autoregression"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -989,7 +1010,7 @@ class ModelAR(BaseModel):
 class ModelARX(BaseModel):
     """ARX：非1-2月 AR 滞后 + 高频外生回归，ElasticNet 正则、TimeSeriesSplit 定参。
     嵌套 AR(惯性锚)，公平检验高频在惯性之上的增量价值。1-2月退化为近期均值。"""
-    name = "ARX"
+    name = "ElasticNet"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1048,7 +1069,7 @@ class ModelPLS(BaseModel):
       - 受小权重(逆MSE^2)与极端值护栏保护，不会因偶发噪声主导结果；
       - 1-2月退化为近期非1-2月均值，与其他模型一致。
     """
-    name = "PLS"
+    name = "PartialLeastSquares"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1131,7 +1152,7 @@ class ModelMFDFM(BaseModel):
         参数(其余月仅用固定参数滤波)。
     1-2月退化为近期非1-2月均值，与其他模型一致。
     """
-    name = "MFDFM"
+    name = "DynamicFactorModel"
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1785,9 +1806,9 @@ class Reporter:
         except Exception as e:
             LOG.warning("matplotlib 不可用，跳过回测图：%s", e)
             return
-        styles = {"AR": ("#1f77b4", "-"), "ARX": ("#d62728", "--"),
-                  "DI": ("#9467bd", "-."), "LightGBM": ("#2ca02c", "-."),
-                  "PLS": ("#8c564b", ":"), "MFDFM": ("#17becf", "--"),
+        styles = {"Autoregression": ("#1f77b4", "-"), "ElasticNet": ("#d62728", "--"),
+                  "DiffusionIndex": ("#9467bd", "-."), "LightGBM": ("#2ca02c", "-."),
+                  "PartialLeastSquares": ("#8c564b", ":"), "DynamicFactorModel": ("#17becf", "--"),
                   "ENSEMBLE": ("#ff7f0e", "-")}
         fig, axes = plt.subplots(2, 1, figsize=(15, 10),
                                  gridspec_kw={"height_ratios": [2, 1]})
@@ -1928,17 +1949,18 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
             "point": round(float(pm.point), 3),
             "weighted_contribution": round(float(w) * float(pm.point), 3)})
 
-    # 机制说明：多数成员(AR/ARX/DI/LightGBM/MFDFM)锚定 AR 惯性，PLS 为纯高频去相关补充。
+    # 机制说明：多数成员(Autoregression/ElasticNet/DiffusionIndex/LightGBM/DynamicFactorModel)
+    # 锚定自回归惯性，PartialLeastSquares 为纯高频去相关补充。
     if cfg.benchmark_name in weights:
-        anchored = [k for k in weights if k != "PLS"]
+        anchored = [k for k in weights if k != "PartialLeastSquares"]
         out["note"] = (
             f"组合由 {('/'.join(weights.keys()))} 构成(权重 "
             f"{', '.join('%s=%.2f' % (k, v) for k, v in weights.items())})。"
             f"其中 {('/'.join(anchored))} 均【锚定 AR 惯性】，预测主要由【工业增加值自身历史的"
             f"惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正"
             f"（经 DM 检验高频对 AR 无显著增量）"
-            + ("；PLS 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
-               if "PLS" in weights else "。"))
+            + ("；PartialLeastSquares 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
+               if "PartialLeastSquares" in weights else "。"))
 
     for name, w in weights.items():
         if w <= 0:
@@ -1954,11 +1976,92 @@ def explain_drivers(per_model: dict, weights: dict, cfg: Config,
                 "model": name, "weight": round(float(w), 3),
                 "top_features": [{"feature": k, "gain_share": round(v / tot, 3)}
                                  for k, v in items]})
-        elif name == "ARX" and "coef_top" in pm.extra:
+        elif name == "ElasticNet" and "coef_top" in pm.extra:
             out["feature_drivers"].append({
                 "model": name, "weight": round(float(w), 3),
                 "top_features": pm.extra["coef_top"]})
     return out
+
+
+# ==============================================================================
+# 第 15.5 节  1-2 月口径：累计同比(合并值) Theta 法预测
+# ==============================================================================
+def _theta_forecast(seq: np.ndarray) -> float:
+    """对一维序列用 Theta 法(statsmodels ThetaModel)做 1 步预测；失败则退化为随机游走。"""
+    from statsmodels.tsa.forecasting.theta import ThetaModel
+    seq = np.asarray(seq, float)
+    seq = seq[np.isfinite(seq)]
+    if len(seq) < 8:
+        return float(seq[-1]) if len(seq) else float("nan")
+    try:
+        m = ThetaModel(pd.Series(seq), period=1, deseasonalize=False).fit()
+        return float(m.forecast(1).iloc[0])
+    except Exception:
+        return float(seq[-1])  # 退化：随机游走(no-change)
+
+
+def forecast_janfeb_combined(raw: dict, cfg: Config) -> dict:
+    """预测【1-2 月累计同比(合并)】：Theta 法作用于累计同比序列，区间用高斯(误差RMSE)。
+
+    背景：NBS 不单独发布 1/2 月、合并于 3 月公布；拆分单月是人造噪声、近乎不可预测。
+    1-2 月合并(=每年 2 月的累计同比)是稳定、可预测的官方量。经"标准方法竞赛(RW/ARIMA/
+    ETS/Theta) + 高频桥接检验"实证：Theta 法在累计同比序列上最稳健且无可质疑(高频反而帮倒忙)。
+
+    返回 dict：target_label / target_month / point / intervals / calib_n / actual(若已公布)。
+    """
+    df = raw[cfg.sheet_target]
+    if cfg.ytd_col not in df.columns:
+        raise RuntimeError(f"汇总表缺少累计同比列：{cfg.ytd_col}（请确认使用含该列的汇总表）。")
+    s = df.set_index("date")[cfg.ytd_col]
+    s.index = to_month_index(s.index)
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    # 关键清洗：剔除【1 月】累计值。NBS 不单独发布 1 月累计(年内首个累计=2月的1-2月合并)；
+    # 汇总表中个别年份的 1 月累计是数据商填充的【杂散/错误值】(如 2024-01=26.3、2023-01=-9.79)，
+    # 若混入会污染序列、把 Theta/末值带飞。真实累计同比序列只含 2-12 月。
+    s = s[s.index.month != 1]
+    if len(s) < 24:
+        raise RuntimeError("累计同比样本不足(<24)，无法稳健预测 1-2 月合并值。")
+
+    # 目标 = 最后一个已发布累计月之后的下一个累计月。中国累计无 1 月：Dec -> Feb(=1-2月合并)。
+    last = s.index.max()
+    nxt = month_end(last + pd.offsets.MonthBegin(1))
+    if nxt.month == 1:
+        nxt = month_end(nxt + pd.offsets.MonthBegin(1))
+    label = (f"{nxt.year}年1-2月累计同比(合并)" if nxt.month == 2
+             else f"{nxt.year}年1-{nxt.month}月累计同比")
+
+    # 点预测：Theta 法(用截至 last 的全部累计同比)
+    point = _theta_forecast(s.values)
+
+    # 区间：高斯区间，尺度 σ = 最近 N 年 Theta 回测误差的 RMSE。两点处理使区间合理：
+    #   (1) 剔除结构断裂年(COVID)，避免极值把 σ 撑爆；
+    #   (2) 只取【最近 janfeb_calib_window 年】误差——高增长期波动远大于当前regime。
+    # 用高斯(而非经验分位数)：年度样本仅~12个，经验分位会让 80%/95% 几乎重合且过粗；高斯由
+    # σ 解析给出，80%/95% 正确分离，是小样本预测区间的标准做法(假设预测误差近似正态)。
+    from scipy.stats import norm
+    feb = s[s.index.month == nxt.month]
+    yr_err = []
+    for ts in feb.index:
+        hist = s[s.index < ts]
+        if len(hist) < 24 or ts.year in cfg.janfeb_break_years:
+            continue
+        yr_err.append((ts.year, _theta_forecast(hist.values) - float(feb.loc[ts])))
+    yr_err = sorted(yr_err)[-cfg.janfeb_calib_window:]          # 最近 N 年
+    errs = np.asarray([e for _, e in yr_err], float)
+    sigma = float(np.sqrt(np.mean(errs ** 2))) if len(errs) >= 3 else float("nan")
+    intervals = {}
+    for lv in cfg.interval_levels:
+        z = norm.ppf(0.5 + lv / 2)
+        hw = z * sigma if np.isfinite(sigma) else float("nan")
+        intervals[lv] = (point - hw, point + hw)
+
+    actual = float(s.loc[nxt]) if nxt in s.index and pd.notna(s.loc[nxt]) else None
+    return {"target_label": label, "target_month": nxt, "point": float(point),
+            "intervals": intervals, "calib_n": int(len(errs)),
+            "sigma": sigma,
+            "method": "Theta 法(statsmodels ThetaModel) 作用于累计同比序列",
+            "actual": actual}
 
 
 # ==============================================================================
@@ -1970,6 +2073,48 @@ def detect_target_month(raw: dict, cfg: Config) -> pd.Timestamp:
         "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
     last = month_end(s.index.max())
     return month_end(last + pd.offsets.MonthBegin(1))
+
+
+def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp) -> dict:
+    """1-2 月窗口的独立流程：用 Theta 法预测 1-2 月累计同比(合并)，落盘并打印。
+
+    不启动当月同比的六模型集合(对 1-2 月单月无意义)；产出一个聚焦的合并值点+区间预测。
+    """
+    res = forecast_janfeb_combined(raw, cfg)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    rec = {"target_label": res["target_label"],
+           "target_month": str(res["target_month"].date()),
+           "caliber": "1-2月累计同比(合并)",
+           "method": res["method"],
+           "point_forecast": round(res["point"], 3)}
+    for lv, (lo, hi) in res["intervals"].items():
+        rec[f"lower_{int(lv*100)}"] = (round(float(lo), 3) if np.isfinite(lo) else None)
+        rec[f"upper_{int(lv*100)}"] = (round(float(hi), 3) if np.isfinite(hi) else None)
+    rec["interval_calibration_n"] = res["calib_n"]
+    rec["note"] = ("国家统计局对 1、2 月工业增加值不单独发布、合并于 3 月公布；拆分单月为人造噪声、"
+                   "近乎不可预测。故此处给出【1-2月累计同比(合并)】预测(Theta法)，不输出单月值。"
+                   "区间基于常态年经验残差校准；遇类 COVID 结构断裂年实际误差可能更大。")
+    if res["actual"] is not None:
+        rec["actual_published"] = res["actual"]
+    with open(os.path.join(cfg.out_dir, "forecast_result.json"), "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=2)
+    pd.DataFrame([{k: v for k, v in rec.items() if not isinstance(v, (dict, list))}]).to_csv(
+        os.path.join(cfg.out_dir, "forecast_result.csv"), index=False, encoding="utf-8-sig")
+
+    LOG.info("采集日(run_date)=%s；落在 1-2 月窗口。", run_date.date())
+    LOG.info("=" * 70)
+    LOG.info("【预测结果】%s", res["target_label"])
+    LOG.info("  方法         : %s", res["method"])
+    LOG.info("  点预测       : %.2f %%", res["point"])
+    for lv in cfg.interval_levels:
+        lo, hi = res["intervals"][lv]
+        LOG.info("  %d%% 区间     : [%.2f, %.2f]", int(lv * 100), lo, hi)
+    LOG.info("  区间校准样本 : %d 个常态年(剔结构断裂年)", res["calib_n"])
+    if res["actual"] is not None:
+        LOG.info("  实际已公布   : %.2f（误差 %+.2f）", res["actual"], res["point"] - res["actual"])
+    LOG.info("  说明：不输出 1/2 月拆分单月(人造噪声)；此为 1-2 月合并口径。")
+    LOG.info("=" * 70)
+    return rec
 
 
 def main(cfg: Config = CFG):
@@ -1987,6 +2132,14 @@ def main(cfg: Config = CFG):
     run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
                 else infer_collection_date(raw)).normalize()
     target_month = detect_target_month(raw, cfg)
+
+    # 1c) 口径切换：目标月为 1 或 2 月(1-2 月窗口)时，不预测拆分单月(人造噪声、不可预测)，
+    #     改为预测【1-2 月累计同比(合并)】，用 Theta 法(见第 15.5 节)。其余月(3-12)走当月同比。
+    if target_month.month in (1, 2):
+        LOG.info("目标月=%s 落在 1-2 月窗口：不预测拆分单月，改预测【1-2月累计同比(合并)】(Theta法)。",
+                 target_month.date())
+        return run_janfeb_pipeline(cfg, raw, run_date)
+
     cfg.asof_gap_days = resolve_asof_gap(cfg, raw, target_month)
     as_of_live = asof_for_target(cfg, target_month)   # == run_date（按构造）
     LOG.info("采集日(run_date)=%s；实盘预测月=%s；as_of=%s（gap=%d天，与采集月是否=目标月无关）",
@@ -2004,25 +2157,25 @@ def main(cfg: Config = CFG):
     _wire_context_cache(ctx)
 
     # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/ARX/DI/
-    #     MFDFM/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
+    #     DynamicFactorModel/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
     ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
         aligner, as_of_live, apply_pub_lag=False)
 
     # 3) 模型集合 —— 六类机制并存，提供方法学多样性：
-    #    AR(单变量惯性) + ARX(线性高频桥接) + DI(PCA因子) + LightGBM(非线性)
-    #    + PLS(纯高频去相关) + MFDFM(状态空间混频动态因子)。
+    #    Autoregression(单变量惯性) + ElasticNet(线性高频桥接) + DiffusionIndex(PCA因子)
+    #    + LightGBM(非线性) + PartialLeastSquares(纯高频去相关) + DynamicFactorModel(状态空间).
     #    是否按 DM 门控剔除由 cfg.ensemble_gate_models 决定（默认 False=全部纳入）。
     models = [
-        ModelAR(cfg),            # 基准：AR(p) BIC（单变量惯性）
-        ModelARX(cfg),           # AR 滞后 + 高频外生（ElasticNet, 时序CV）
-        ModelDI(cfg),            # 扩散指数/因子模型（AR滞后 + 高频PCA因子, 岭回归, Stock-Watson）
+        ModelAR(cfg),            # 名称=Autoregression：AR(p) BIC（单变量惯性，基准）
+        ModelARX(cfg),           # 名称=ElasticNet：AR滞后 + 高频外生弹性网回归
+        ModelDI(cfg),            # 名称=DiffusionIndex：AR滞后 + 高频PCA因子岭回归(Stock-Watson)
     ]
     if cfg.enable_probe_models:
-        models += [ModelLGB(cfg)]    # 锚定 + 梯度提升残差（非线性）
+        models += [ModelLGB(cfg)]    # 名称=LightGBM：锚定 + 梯度提升残差（非线性）
     if cfg.enable_pls:
-        models += [ModelPLS(cfg)]    # 纯当月高频 PLS 桥接（不锚AR, 去相关多样性）
+        models += [ModelPLS(cfg)]    # 名称=PartialLeastSquares：纯当月高频桥接(不锚AR)
     if cfg.enable_dfm:
-        models += [ModelMFDFM(cfg)]  # 混频动态因子（状态空间Kalman因子 + 锚定AR岭回归）
+        models += [ModelMFDFM(cfg)]  # 名称=DynamicFactorModel：状态空间Kalman因子+锚定AR岭回归
     model_names = [m.name for m in models]
 
     # 4) 回测（伪真实时点）
