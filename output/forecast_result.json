@@ -1,5 +1,8 @@
 {
   "target_month": "2026-05-31",
+  "target_label": "2026年5月当月同比",
+  "caliber": "当月同比",
+  "display": 4.63,
   "point_forecast": 4.63,
   "lower_80": 3.074,
   "upper_80": 6.186,

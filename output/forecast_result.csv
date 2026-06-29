@@ -1,2 +1,2 @@
-﻿target_month,point_forecast,lower_80,upper_80,lower_95,upper_95
-2026-05-31,4.63,3.074,6.186,2.144,7.116
+﻿target_month,target_label,caliber,display,point_forecast,lower_80,upper_80,lower_95,upper_95
+2026-05-31,2026年5月当月同比,当月同比,4.63,4.63,3.074,6.186,2.144,7.116

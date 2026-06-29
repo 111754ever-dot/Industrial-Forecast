@@ -41,10 +41,11 @@
 1-2 月口径（统一产出按目标月切换）
 --------------------------------
 国家统计局对工业增加值【不单独发布 1 月、2 月】，而是把 1-2 月合并、于 3 月中旬一起公布；
-"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统：
-  * 目标月 3-12 月：预测并显示【当月同比】（上面的六模型集合）；
-  * 目标月 1 月    ：不单独预测 1 月单月（无意义）；
-  * 目标月 2 月（即 1-2 月窗口）：改为预测【1-2 月累计同比(合并)】——经"标准方法竞赛
+"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统【按目标月切换显示口径】
+(平台部署用，目标月可由 cfg.force_target_month 指定、否则自动取下一个未发布月)：
+  * 目标月 3-12 月：显示【当月同比】（上面的六模型集合）；输出 display=数值。
+  * 目标月 1 月    ：1 月不单独发布、不预测，显示 "-"；输出 display="-"。
+  * 目标月 2 月    ：显示【1-2 月累计同比(合并)】——经"标准方法竞赛
     (RW/ARIMA/ETS/Theta)+高频桥接检验"实证：Theta 法(M3竞赛公认方法)在累计同比序列上与
     最优的随机游走几乎等价、优于 ARIMA/ETS，且为【单一公认模型】(既避免裸RW"结转去年"
     的观感，也避免 RW+ARIMA+Theta 三法因高度相关而冗余)。故 1-2 月合并采用 Theta 法
@@ -129,6 +130,9 @@ class Config:
     # 回测各历史月用同一 gap，随采集时间自动平移、不写死。None 时自动从数据推断。
     run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
     asof_gap_days: Optional[int] = None     # None=自动取 run_date−目标月起点；由 main() 解析
+    # 指定预测目标月（平台部署用，按月查询展示）。如 "2026-02"；None=自动取下一个未发布月。
+    # 显示口径按目标月：1月->"-"(不单独预测)；2月->1-2月累计同比(合并)；3-12月->当月同比。
+    force_target_month: Optional[str] = None
     # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
     pub_lag_month_days: int = 16     # 月度宏观【默认】发布滞后（社零/投资/发电/产量 15-17日）。
@@ -1798,6 +1802,9 @@ class Reporter:
     def save_forecast(self, target_month, point, intervals, per_model: dict, drivers):
         cfg = self.cfg
         rec = {"target_month": str(month_end(target_month).date()),
+               "target_label": f"{month_end(target_month).year}年{target_month.month}月当月同比",
+               "caliber": "当月同比",
+               "display": round(float(point), 2),   # 平台直接展示的数值(单位%)
                "point_forecast": round(float(point), 3)}
         for lv, (lo, hi) in intervals.items():
             rec[f"lower_{int(lv*100)}"] = round(float(lo), 3)
@@ -2020,13 +2027,17 @@ def _theta_forecast(seq: np.ndarray) -> float:
         return float(seq[-1])  # 退化：随机游走(no-change)
 
 
-def forecast_janfeb_combined(raw: dict, cfg: Config) -> dict:
+def forecast_janfeb_combined(raw: dict, cfg: Config,
+                             target_month: Optional[pd.Timestamp] = None) -> dict:
     """预测【1-2 月累计同比(合并)】：Theta 法作用于累计同比序列，区间用高斯(误差RMSE)。
 
     背景：NBS 不单独发布 1/2 月、合并于 3 月公布；拆分单月是人造噪声、近乎不可预测。
     1-2 月合并(=每年 2 月的累计同比)是稳定、可预测的官方量。经"标准方法竞赛(RW/ARIMA/
     ETS/Theta) + 高频桥接检验"实证：Theta 法(M3竞赛公认方法)与最优的随机游走几乎等价、优于
     ARIMA/ETS，且为单一公认模型；高频桥接经检验反而帮倒忙，故不引入。
+
+    target_month：指定要预测的 2 月(月末)。None 时自动取序列下一个未发布累计月(Dec->Feb)。
+    无论指定与否，点预测仅用【严格早于目标月】的累计数据(hist)，杜绝前视。
 
     返回 dict：target_label / target_month / point / intervals / calib_n / actual(若已公布)。
     """
@@ -2044,16 +2055,22 @@ def forecast_janfeb_combined(raw: dict, cfg: Config) -> dict:
     if len(s) < 24:
         raise RuntimeError("累计同比样本不足(<24)，无法稳健预测 1-2 月合并值。")
 
-    # 目标 = 最后一个已发布累计月之后的下一个累计月。中国累计无 1 月：Dec -> Feb(=1-2月合并)。
-    last = s.index.max()
-    nxt = month_end(last + pd.offsets.MonthBegin(1))
-    if nxt.month == 1:
-        nxt = month_end(nxt + pd.offsets.MonthBegin(1))
+    # 目标累计月。指定则用之；否则取最后一个已发布累计月之后的下一个(中国累计无1月: Dec->Feb)。
+    if target_month is not None:
+        nxt = month_end(target_month)
+    else:
+        last = s.index.max()
+        nxt = month_end(last + pd.offsets.MonthBegin(1))
+        if nxt.month == 1:
+            nxt = month_end(nxt + pd.offsets.MonthBegin(1))
     label = (f"{nxt.year}年1-2月累计同比(合并)" if nxt.month == 2
              else f"{nxt.year}年1-{nxt.month}月累计同比")
 
-    # 点预测：Theta 法(用截至 last 的全部累计同比)
-    point = _theta_forecast(s.values)
+    # 点预测：Theta 法，仅用【严格早于目标月】的累计数据(实时安全；指定历史月回测亦无泄漏)。
+    hist = s[s.index < nxt]
+    if len(hist) < 24:
+        raise RuntimeError("目标月之前的累计同比样本不足(<24)，无法稳健预测。")
+    point = _theta_forecast(hist.values)
 
     # 区间：高斯区间，尺度 σ = 最近 N 年 Theta 回测误差的 RMSE。两点处理使区间合理：
     #   (1) 剔除结构断裂年(COVID)，避免极值把 σ 撑爆；
@@ -2096,16 +2113,39 @@ def detect_target_month(raw: dict, cfg: Config) -> pd.Timestamp:
     return month_end(last + pd.offsets.MonthBegin(1))
 
 
-def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp) -> dict:
-    """1-2 月窗口的独立流程：用 Theta 法预测 1-2 月累计同比(合并)，落盘并打印。
+def run_january_blank(cfg: Config, raw: dict, target_month: pd.Timestamp) -> dict:
+    """目标月=1 月：NBS 不单独发布 1 月工业增加值，故【不预测】、平台显示 "-"。"""
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    rec = {"target_label": f"{target_month.year}年1月",
+           "target_month": str(target_month.date()),
+           "caliber": "1月(不单独发布，不预测)",
+           "display": "-",
+           "point_forecast": None,
+           "note": ("国家统计局不单独发布 1 月工业增加值(1、2 月合并于次年 3 月中旬公布)；"
+                    "故 1 月单月不预测，显示 \"-\"。如需 1-2 月情况，请查询 2 月(1-2月累计同比合并值)。")}
+    with open(os.path.join(cfg.out_dir, "forecast_result.json"), "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=2)
+    pd.DataFrame([rec]).to_csv(os.path.join(cfg.out_dir, "forecast_result.csv"),
+                               index=False, encoding="utf-8-sig")
+    LOG.info("=" * 70)
+    LOG.info("【预测结果】%s：不单独预测，显示 \"-\"", rec["target_label"])
+    LOG.info("  说明：%s", rec["note"])
+    LOG.info("=" * 70)
+    return rec
+
+
+def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp,
+                        target_month: Optional[pd.Timestamp] = None) -> dict:
+    """目标月=2 月：用 Theta 法预测【1-2 月累计同比(合并)】，落盘并打印。
 
     不启动当月同比的六模型集合(对 1-2 月单月无意义)；产出一个聚焦的合并值点+区间预测。
     """
-    res = forecast_janfeb_combined(raw, cfg)
+    res = forecast_janfeb_combined(raw, cfg, target_month=target_month)
     os.makedirs(cfg.out_dir, exist_ok=True)
     rec = {"target_label": res["target_label"],
            "target_month": str(res["target_month"].date()),
            "caliber": "1-2月累计同比(合并)",
+           "display": round(res["point"], 2),     # 平台直接展示的数值(单位%)
            "method": res["method"],
            "point_forecast": round(res["point"], 3)}
     for lv, (lo, hi) in res["intervals"].items():
@@ -2122,7 +2162,7 @@ def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp) -> dict:
     pd.DataFrame([{k: v for k, v in rec.items() if not isinstance(v, (dict, list))}]).to_csv(
         os.path.join(cfg.out_dir, "forecast_result.csv"), index=False, encoding="utf-8-sig")
 
-    LOG.info("采集日(run_date)=%s；落在 1-2 月窗口。", run_date.date())
+    LOG.info("采集日(run_date)=%s；目标月落在 1-2 月窗口。", run_date.date())
     LOG.info("=" * 70)
     LOG.info("【预测结果】%s", res["target_label"])
     LOG.info("  方法         : %s", res["method"])
@@ -2152,14 +2192,20 @@ def main(cfg: Config = CFG):
     # 1b) 预测时点不写死、不需外部采集日：数据前沿(表内最新日期)即 run_date，全部从表推断。
     run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
                 else infer_collection_date(raw)).normalize()
-    target_month = detect_target_month(raw, cfg)
+    # 目标月：平台可用 cfg.force_target_month 指定(按月查询)；否则自动取下一个未发布月。
+    target_month = (month_end(pd.Timestamp(cfg.force_target_month + "-01"))
+                    if cfg.force_target_month else detect_target_month(raw, cfg))
 
-    # 1c) 口径切换：目标月为 1 或 2 月(1-2 月窗口)时，不预测拆分单月(人造噪声、不可预测)，
-    #     改为预测【1-2 月累计同比(合并)】，用 Theta 法(见第 15.5 节)。其余月(3-12)走当月同比。
-    if target_month.month in (1, 2):
-        LOG.info("目标月=%s 落在 1-2 月窗口：不预测拆分单月，改预测【1-2月累计同比(合并)】(Theta法)。",
-                 target_month.date())
-        return run_janfeb_pipeline(cfg, raw, run_date)
+    # 1c) 显示口径按目标月切换(平台展示规则)：
+    #     · 1 月    -> 不单独发布、不预测，显示 "-"；
+    #     · 2 月    -> 显示【1-2 月累计同比(合并)】(Theta 法，见第 15.5 节)；
+    #     · 3-12 月 -> 显示该月【当月同比】(下面的六模型集合)。
+    if target_month.month == 1:
+        LOG.info("目标月=%s：1 月不单独发布，不预测，显示 \"-\"。", target_month.date())
+        return run_january_blank(cfg, raw, target_month)
+    if target_month.month == 2:
+        LOG.info("目标月=%s：显示【1-2月累计同比(合并)】(Theta法)。", target_month.date())
+        return run_janfeb_pipeline(cfg, raw, run_date, target_month=target_month)
 
     cfg.asof_gap_days = resolve_asof_gap(cfg, raw, target_month)
     as_of_live = asof_for_target(cfg, target_month)   # == run_date（按构造）
