@@ -41,11 +41,11 @@
 1-2 月口径（统一产出按目标月切换）
 --------------------------------
 国家统计局对工业增加值【不单独发布 1 月、2 月】，而是把 1-2 月合并、于 3 月中旬一起公布；
-"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统【按目标月切换显示口径】
-(平台部署用，目标月可由 cfg.force_target_month 指定、否则自动取下一个未发布月)：
-  * 目标月 3-12 月：显示【当月同比】（上面的六模型集合）；输出 display=数值。
-  * 目标月 1 月    ：1 月不单独发布、不预测，显示 "-"；输出 display="-"。
-  * 目标月 2 月    ：显示【1-2 月累计同比(合并)】——经"标准方法竞赛
+"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统【按数据汇总表自动检测的
+"下一个未发布月"切换显示口径】(下个月 = 最后一个当月同比月 + 1)：
+  * 下个月 3-12 月：显示该月【当月同比】（上面的六模型集合）；输出 display=数值。
+  * 下个月 1 月    ：1 月不单独发布、不预测，显示 "-"；输出 display="-"。
+  * 下个月 2 月    ：显示【1-2 月累计同比(合并)】——经"标准方法竞赛
     (RW/ARIMA/ETS/Theta)+高频桥接检验"实证：Theta 法(M3竞赛公认方法)在累计同比序列上与
     最优的随机游走几乎等价、优于 ARIMA/ETS，且为【单一公认模型】(既避免裸RW"结转去年"
     的观感，也避免 RW+ARIMA+Theta 三法因高度相关而冗余)。故 1-2 月合并采用 Theta 法
@@ -130,9 +130,6 @@ class Config:
     # 回测各历史月用同一 gap，随采集时间自动平移、不写死。None 时自动从数据推断。
     run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
     asof_gap_days: Optional[int] = None     # None=自动取 run_date−目标月起点；由 main() 解析
-    # 指定预测目标月（平台部署用，按月查询展示）。如 "2026-02"；None=自动取下一个未发布月。
-    # 显示口径按目标月：1月->"-"(不单独预测)；2月->1-2月累计同比(合并)；3-12月->当月同比。
-    force_target_month: Optional[str] = None
     # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
     pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
     pub_lag_month_days: int = 16     # 月度宏观【默认】发布滞后（社零/投资/发电/产量 15-17日）。
@@ -2192,14 +2189,13 @@ def main(cfg: Config = CFG):
     # 1b) 预测时点不写死、不需外部采集日：数据前沿(表内最新日期)即 run_date，全部从表推断。
     run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
                 else infer_collection_date(raw)).normalize()
-    # 目标月：平台可用 cfg.force_target_month 指定(按月查询)；否则自动取下一个未发布月。
-    target_month = (month_end(pd.Timestamp(cfg.force_target_month + "-01"))
-                    if cfg.force_target_month else detect_target_month(raw, cfg))
+    # 目标月 = 数据汇总表自动检测的【下一个未发布月】(最后一个当月同比月 + 1)。
+    target_month = detect_target_month(raw, cfg)
 
-    # 1c) 显示口径按目标月切换(平台展示规则)：
-    #     · 1 月    -> 不单独发布、不预测，显示 "-"；
-    #     · 2 月    -> 显示【1-2 月累计同比(合并)】(Theta 法，见第 15.5 节)；
-    #     · 3-12 月 -> 显示该月【当月同比】(下面的六模型集合)。
+    # 1c) 显示口径按【检测到的下个月】切换：
+    #     · 下个月=1 月    -> 1 月不单独发布、不预测，显示 "-"；
+    #     · 下个月=2 月    -> 显示【1-2 月累计同比(合并)】(Theta 法，见第 15.5 节)；
+    #     · 下个月=3-12 月 -> 显示该月【当月同比】(下面的六模型集合)。
     if target_month.month == 1:
         LOG.info("目标月=%s：1 月不单独发布，不预测，显示 \"-\"。", target_month.date())
         return run_january_blank(cfg, raw, target_month)
