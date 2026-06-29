@@ -15,13 +15,13 @@
 为何这样设计（与方案一一对应）
 --------------------------------
 * 频率不一致：四种频率全部"对齐到月"，高频指标按"真实时点可得"聚合（均值/月末值/
-  月内进度），杜绝前视偏差。
+  月内进度），避免前视偏差。
 * 样本长度不一致：**绝不截断到统一起止日期**（那样会被 2022 年才开始的指标拖到只剩
   3 年样本，丢掉 30 年历史）。改用：真实时点(vintage)对齐 + 各模型按能力处理缺失
   （AR 仅用目标自身；ARX 用"预测点可观测 + 训练覆盖充分"的高频，无需硬填）。
 * 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
 * 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
-  conformal)校准"，保证经验覆盖达标且不过窄。
+  conformal)校准"，力求经验覆盖达标且不过窄。
 * 模型集合（六类机制并存，提供方法学多样性。多数成员【锚定 AR 惯性】以避免纯高频模型的
   系统性高估；组合提升的关键是【误差去相关】而非单体精度，故保留单体较弱但去相关的成员）：
     - Autoregression      ：单变量自回归 AR(p)（基准/锚），BIC 定阶；
@@ -45,9 +45,10 @@
   * 目标月 3-12 月：预测并显示【当月同比】（上面的六模型集合）；
   * 目标月 1 月    ：不单独预测 1 月单月（无意义）；
   * 目标月 2 月（即 1-2 月窗口）：改为预测【1-2 月累计同比(合并)】——经"标准方法竞赛
-    (RW/ARIMA/ETS/Theta)+高频桥接检验"实证，Theta 法在累计同比序列上最稳健且无可质疑，
-    故 1-2 月合并采用 Theta 法（statsmodels ThetaModel），区间为高斯(近年误差RMSE为σ)。
-    实现见 forecast_janfeb_combined()。
+    (RW/ARIMA/ETS/Theta)+高频桥接检验"实证：Theta 法(M3竞赛公认方法)在累计同比序列上与
+    最优的随机游走几乎等价、优于 ARIMA/ETS，且为【单一公认模型】(既避免裸RW"结转去年"
+    的观感，也避免 RW+ARIMA+Theta 三法因高度相关而冗余)。故 1-2 月合并采用 Theta 法
+    （statsmodels ThetaModel），区间为高斯(近年误差RMSE为σ)。实现见 forecast_janfeb_combined()。
 
 真实时点（ragged edge）口径
 --------------------------
@@ -56,7 +57,7 @@
   - 月度宏观自变量(社零/投资/PPI/PMI…)：发布到 T-1（次月中旬才发布 T）；
   - 高频(日/周/旬)：基本覆盖到 T 月底。
 本系统用"参考期末 + 发布滞后 pub_lag_days <= as_of"统一判定每个观测是否可见，
-回测与实盘使用完全相同的可见性规则，确保无前视偏差、训练/测试一致。
+回测与实盘使用完全相同的可见性规则，据此避免前视偏差、保持训练/测试口径一致。
 
 运行
 ----
@@ -69,7 +70,7 @@
 
 作者注
 ------
-代码以"正确、权威、可常态化复用"为标准撰写，不以运行速度为目标。每个模型都做了
+代码以"正确、规范、可常态化复用"为标准撰写，不以运行速度为目标。每个模型都做了
 异常隔离：单个模型失败不会中断整条流水线（会记录并在组合中自动剔除）。
 ================================================================================
 """
@@ -173,7 +174,8 @@ class Config:
     # ---- 1-2 月口径(累计同比合并值, Theta 法) ----
     # 国家统计局对 1、2 月工业增加值不单独发布、合并于 3 月中旬公布；拆分单月是人造噪声。
     # 故目标月为 1 或 2 月时，改为预测【1-2 月累计同比(合并)】，模型用 Theta 法
-    # (statsmodels ThetaModel，作用于累计同比序列)——经"标准方法竞赛+高频桥接检验"实证为最稳健。
+    # (statsmodels ThetaModel，作用于累计同比序列)——经标准方法竞赛实证：与最优的随机游走
+    # 几乎等价、优于 ARIMA/ETS，且为单一公认模型(详见 forecast_janfeb_combined)。
     janfeb_break_years: tuple = (2020, 2021)  # 结构断裂年(COVID)：从区间校准残差中剔除，避免区间被极值撑爆
     janfeb_calib_window: int = 12             # 区间校准只用最近 N 年残差(贴合当前增速regime，不被高增长期撑宽)
 
@@ -248,6 +250,11 @@ def build_indicator_dict(cfg: Config) -> list[Indicator]:
         Indicator("IVA_yoy", "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)", TG,
                   "target", "last", True, "target",
                   "目标：1-2月【拆分】口径，与社零的【合并】口径不同，勿混用"),
+        # 累计同比：仅供【1-2月合并(Theta法)】流程使用(见 forecast_janfeb_combined)，
+        # 角色 'ytd_aux' 使其【不进入 3-12 月当月同比模型/面板】；登记于此仅为通过列名校验、
+        # 并写入指标字典文档(避免被误报为"额外未使用列")。
+        Indicator("IVA_ytd", cfg.ytd_col, TG, "yoy_keep", "last", False, "ytd_aux",
+                  "工业增加值【累计同比】；仅用于 1-2 月合并预测，不参与当月同比模型"),
 
         # ===== 月度 =====
         Indicator("retail_yoy", "中国:社会消费品零售总额:当月同比(1-2月合并)", M,
@@ -521,7 +528,7 @@ class Transformer:
 # 第 5 节  混频对齐（真实时点 / 参差边缘）
 # ==============================================================================
 class FrequencyAligner:
-    """把所有频率对齐到"月末"，并严格按 as_of 信息集构造特征，杜绝前视偏差。
+    """把所有频率对齐到"月末"，并严格按 as_of 信息集构造特征，避免前视偏差。
 
     核心方法 build_monthly_panel(as_of)：
       给定评估时点 as_of，对每个指标只用"参考期末 + 发布滞后 <= as_of"的观测，
@@ -628,6 +635,10 @@ class FrequencyAligner:
         cfg = self.cfg
         cols = {}
         for ind in self.indicators:
+            # 仅【目标】与【预测变量】进入当月同比面板；辅助列(如累计同比 role='ytd_aux')
+            # 只为列名校验/字典文档登记，不参与当月同比模型，故跳过。
+            if ind.role not in ("target", "predictor"):
+                continue
             vis = self._visible_raw(ind, as_of, apply_pub_lag)
             if len(vis) == 0:
                 continue
@@ -1296,13 +1307,16 @@ class Context:
         self.cfg = cfg
         self.aligner = aligner
         self.fb = fb
-        self._panel_cache: dict[pd.Timestamp, pd.DataFrame] = {}
+        # 缓存键为 (as_of, apply_pub_lag) 二元组，区分"按发布滞后过滤"与"全表可得"两种面板。
+        self._panel_cache: dict[tuple, pd.DataFrame] = {}
         self._rt_feat: Optional[pd.DataFrame] = None
+        # 实盘采集时点：该 as_of 用【全表(无pub_lag)】面板("自动更新表出现即可得")。由 main() 设置。
+        self.live_as_of: Optional[pd.Timestamp] = None
 
-    def panel_asof(self, as_of: pd.Timestamp) -> pd.DataFrame:
-        if as_of not in self._panel_cache:
-            self._panel_cache[as_of] = self.aligner.build_monthly_panel(as_of)
-        return self._panel_cache[as_of]
+    def panel_asof(self, as_of: pd.Timestamp,
+                   apply_pub_lag: bool = True) -> pd.DataFrame:
+        # 经由已包装(带缓存+实盘覆盖)的 aligner.build_monthly_panel 取面板。
+        return self.aligner.build_monthly_panel(as_of, apply_pub_lag=apply_pub_lag)
 
     def realtime_feature_matrix(self) -> pd.DataFrame:
         """【真实时点(vintage)特征矩阵】——修复 ARX/LGB 训练与预测信息集不一致。
@@ -1310,7 +1324,7 @@ class Context:
         每一行 m 都用"在 as_of(m)=m月起点+asof_gap_days 能看到的数据"构造(panel@as_of_m)：
           - 当月 m 高频=残月(到约19日)、月度宏观当月值=未发布(NaN)；
           - 过去月份 m-1, m-2…=完整可见；目标滞后=已发布部分。
-        于是【训练行与预测行具有完全相同的可得性结构】，杜绝"训练用完整月、预测用残月"
+        于是【训练行与预测行具有完全相同的可得性结构】，消除"训练用完整月、预测用残月"
         的信息集不一致。该矩阵与"何时运行"无关(行 m 只依赖 m 自身的 as_of)，故全局构建
         一次并缓存，回测各步与实盘共享、且天然无前视。
         """
@@ -1330,27 +1344,33 @@ class Context:
         # 关键：特征保持 vintage，但【标签 __target__ 必须用已实现的真实目标值】
         # (vintage 行的当月目标未发布=NaN，不能当训练标签；其余 y 滞后特征仍是 vintage)
         rt["__target__"] = full["IVA_yoy"].reindex(rt.index)
-        # 注：实盘目标月那一行的特征，由 main() 预置在 _panel_cache 的【全表(无pub_lag)面板】
-        # 提供——因 as_of(目标月)==run_date 命中该缓存，故实盘行天然用"表中已可得数据"。
+        # 注：实盘目标月那一行，其 as_of(目标月)==ctx.live_as_of，缓存代理对它强制用【全表
+        # (无pub_lag)面板】，故实盘行天然用"表中已可得数据"(而非按假定滞后过滤后的数据)。
         self._rt_feat = rt
         LOG.info("已构建真实时点(vintage)特征矩阵：%s", rt.shape)
         return self._rt_feat
 
 
-# 让各模型经由 Context 拿到 aligner（DFM/AR 直接用 ctx.aligner，但内部调用的是
-# ctx.panel_asof 的缓存版本——这里把 aligner.build_monthly_panel 代理到缓存）。
+# 把 aligner.build_monthly_panel 包一层缓存，使所有模型(经 ctx.aligner)复用面板、避免重复构造。
 def _wire_context_cache(ctx: Context):
-    """把 aligner.build_monthly_panel 包一层缓存，使 DFM/AR 等也复用缓存面板。"""
-    raw_build = ctx.aligner.build_monthly_panel
+    """为 aligner.build_monthly_panel 安装缓存代理。
 
-    def cached(as_of):
-        return ctx.panel_asof_raw(as_of, raw_build)
-    # 安装缓存代理
-    def panel_asof_raw(as_of, builder):
-        if as_of not in ctx._panel_cache:
-            ctx._panel_cache[as_of] = builder(as_of)
-        return ctx._panel_cache[as_of]
-    ctx.panel_asof_raw = panel_asof_raw
+    要点(修复两处隐患)：
+      (1) 保留 apply_pub_lag 参数——包装后仍可显式传 apply_pub_lag=False；
+      (2) 缓存键为 (as_of, 生效的apply_pub_lag) 二元组——同一 as_of 的两种口径互不串味；
+      (3) 实盘覆盖：当 as_of == ctx.live_as_of 时，强制 apply_pub_lag=False(自动更新表"出现
+          即可得"，不按假定滞后删已存在数据)，使实盘行天然用"表中已可得数据"。
+    """
+    raw_build = ctx.aligner.build_monthly_panel   # 原始(未包装)方法
+
+    def cached(as_of, apply_pub_lag: bool = True):
+        eff = (False if (ctx.live_as_of is not None and as_of == ctx.live_as_of)
+               else apply_pub_lag)
+        key = (as_of, eff)
+        if key not in ctx._panel_cache:
+            ctx._panel_cache[key] = raw_build(as_of, apply_pub_lag=eff)
+        return ctx._panel_cache[key]
+
     ctx.aligner.build_monthly_panel = cached
 
 
@@ -1399,7 +1419,7 @@ def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
 
     asof_gap_days 不写死：由 main() 按【采集日 − 实盘目标月起点】解析并写回 cfg，随采集
     时间自动平移；对实盘目标月该 as_of 恰为 run_date(与采集月是否等于目标月无关)。
-    若未解析(独立调用)回退 gap=22(≈当月23号)。回测与实盘同一规则，杜绝前视偏差。
+    若未解析(独立调用)回退 gap=22(≈当月23号)。回测与实盘同一规则，避免前视偏差。
     """
     tm = month_end(target_month)
     gap = cfg.asof_gap_days if cfg.asof_gap_days is not None else 22
@@ -2005,7 +2025,8 @@ def forecast_janfeb_combined(raw: dict, cfg: Config) -> dict:
 
     背景：NBS 不单独发布 1/2 月、合并于 3 月公布；拆分单月是人造噪声、近乎不可预测。
     1-2 月合并(=每年 2 月的累计同比)是稳定、可预测的官方量。经"标准方法竞赛(RW/ARIMA/
-    ETS/Theta) + 高频桥接检验"实证：Theta 法在累计同比序列上最稳健且无可质疑(高频反而帮倒忙)。
+    ETS/Theta) + 高频桥接检验"实证：Theta 法(M3竞赛公认方法)与最优的随机游走几乎等价、优于
+    ARIMA/ETS，且为单一公认模型；高频桥接经检验反而帮倒忙，故不引入。
 
     返回 dict：target_label / target_month / point / intervals / calib_n / actual(若已公布)。
     """
@@ -2156,10 +2177,9 @@ def main(cfg: Config = CFG):
     ctx = Context(cfg, aligner, fb)
     _wire_context_cache(ctx)
 
-    # 2b) 预置【实盘全表面板(无pub_lag)】到缓存：实盘 as_of 命中此面板，使 AR/ARX/DI/
-    #     DynamicFactorModel/数据质量报告统一读到"自动更新表中已可得数据"，不被发布滞后过滤。
-    ctx._panel_cache[as_of_live] = FrequencyAligner.build_monthly_panel(
-        aligner, as_of_live, apply_pub_lag=False)
+    # 2b) 标记实盘采集时点：对该 as_of，缓存代理强制用【全表(无pub_lag)】面板("自动更新表
+    #     出现即可得")，使各模型/数据质量报告的实盘行统一读到"表中已可得数据"，不被发布滞后过滤。
+    ctx.live_as_of = as_of_live
 
     # 3) 模型集合 —— 六类机制并存，提供方法学多样性：
     #    Autoregression(单变量惯性) + ElasticNet(线性高频桥接) + DiffusionIndex(PCA因子)

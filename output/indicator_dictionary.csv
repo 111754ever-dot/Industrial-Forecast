@@ -1,5 +1,6 @@
 ﻿key,name,sheet,transform,dfm_tier,role,note
 IVA_yoy,中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分),工业增加值,target,True,target,目标：1-2月【拆分】口径，与社零的【合并】口径不同，勿混用
+IVA_ytd,中国:工业增加值:规模以上工业企业:累计同比,工业增加值,yoy_keep,False,ytd_aux,工业增加值【累计同比】；仅用于 1-2 月合并预测，不参与当月同比模型
 retail_yoy,中国:社会消费品零售总额:当月同比(1-2月合并),月度,yoy_keep,True,predictor,1-2月【合并】口径；与目标拆分口径不同，1/2月对齐需谨慎
 fai_cum,中国:固定资产投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：先还原当月值再算当月同比；勿当水平值；1月空、2月为1-2合并
 reinv_cum,中国:房地产开发投资完成额:累计值,月度,cum2mom2yoy,True,predictor,累计值(YTD)：同上还原；与固投累计值是两条近名指标，勿混
