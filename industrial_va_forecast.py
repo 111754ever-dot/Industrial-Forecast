@@ -1809,12 +1809,14 @@ class Reporter:
         rec["per_model"] = {k: (round(float(v.point), 3) if v else None)
                             for k, v in per_model.items()}
         rec["top_drivers"] = drivers
+        rec["显示规则"] = display_rule(
+            f"下个月={target_month.month}月(3-12月) → 显示该月【当月同比】预测值")
         path = os.path.join(cfg.out_dir, "forecast_result.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rec, f, ensure_ascii=False, indent=2)
         LOG.info("已保存预测结果：%s", path)
-        # 同时存一份单行 csv 便于传阅
-        flat = {k: v for k, v in rec.items() if k not in ("per_model", "top_drivers")}
+        # 同时存一份单行 csv 便于传阅（排除嵌套的 dict/list 字段）
+        flat = {k: v for k, v in rec.items() if not isinstance(v, (dict, list))}
         pd.DataFrame([flat]).to_csv(
             os.path.join(cfg.out_dir, "forecast_result.csv"),
             index=False, encoding="utf-8-sig")
@@ -2110,6 +2112,28 @@ def detect_target_month(raw: dict, cfg: Config) -> pd.Timestamp:
     return month_end(last + pd.offsets.MonthBegin(1))
 
 
+def display_rule(current_case: str) -> dict:
+    """输出中的【显示规则说明】——写进每个 forecast_result.json，便于交接者直观理解口径切换。
+
+    current_case 标注本次运行命中的是哪一种(由调用方传入)。
+    """
+    return {
+        "_说明": "显示口径按【数据汇总表自动检测的'下一个未发布月'】切换；下个月 = 最后一个当月同比月 + 1。",
+        "下个月=1月": "显示 \"-\"（国家统计局不单独发布 1 月工业增加值，故不预测）",
+        "下个月=2月": "显示【1-2月累计同比(合并值)】（Theta 法）",
+        "下个月=3至12月": "显示该月【当月同比】预测值（六模型集合）",
+        "本次命中": current_case,
+    }
+
+
+def _log_display_rule():
+    """在控制台打印【显示规则】，便于交接者直观理解三种口径切换。"""
+    LOG.info("  ── 显示规则(按自动检测的下个月切换) ──")
+    LOG.info("     · 下个月=1月    → 显示 \"-\"（1月不单独发布、不预测）")
+    LOG.info("     · 下个月=2月    → 显示【1-2月累计同比(合并值)】")
+    LOG.info("     · 下个月=3-12月 → 显示该月【当月同比】预测值")
+
+
 def run_january_blank(cfg: Config, raw: dict, target_month: pd.Timestamp) -> dict:
     """目标月=1 月：NBS 不单独发布 1 月工业增加值，故【不预测】、平台显示 "-"。"""
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -2119,14 +2143,16 @@ def run_january_blank(cfg: Config, raw: dict, target_month: pd.Timestamp) -> dic
            "display": "-",
            "point_forecast": None,
            "note": ("国家统计局不单独发布 1 月工业增加值(1、2 月合并于次年 3 月中旬公布)；"
-                    "故 1 月单月不预测，显示 \"-\"。如需 1-2 月情况，请查询 2 月(1-2月累计同比合并值)。")}
+                    "故 1 月单月不预测，显示 \"-\"。如需 1-2 月情况，请查询 2 月(1-2月累计同比合并值)。"),
+           "显示规则": display_rule("下个月=1月 → 显示 \"-\"")}
     with open(os.path.join(cfg.out_dir, "forecast_result.json"), "w", encoding="utf-8") as f:
         json.dump(rec, f, ensure_ascii=False, indent=2)
-    pd.DataFrame([rec]).to_csv(os.path.join(cfg.out_dir, "forecast_result.csv"),
-                               index=False, encoding="utf-8-sig")
+    pd.DataFrame([{k: v for k, v in rec.items() if not isinstance(v, (dict, list))}]).to_csv(
+        os.path.join(cfg.out_dir, "forecast_result.csv"), index=False, encoding="utf-8-sig")
     LOG.info("=" * 70)
     LOG.info("【预测结果】%s：不单独预测，显示 \"-\"", rec["target_label"])
     LOG.info("  说明：%s", rec["note"])
+    _log_display_rule()
     LOG.info("=" * 70)
     return rec
 
@@ -2152,6 +2178,7 @@ def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp,
     rec["note"] = ("国家统计局对 1、2 月工业增加值不单独发布、合并于 3 月公布；拆分单月为人造噪声、"
                    "近乎不可预测。故此处给出【1-2月累计同比(合并)】预测(Theta法)，不输出单月值。"
                    "区间基于常态年经验残差校准；遇类 COVID 结构断裂年实际误差可能更大。")
+    rec["显示规则"] = display_rule("下个月=2月 → 显示【1-2月累计同比(合并值)】")
     if res["actual"] is not None:
         rec["actual_published"] = res["actual"]
     with open(os.path.join(cfg.out_dir, "forecast_result.json"), "w", encoding="utf-8") as f:
@@ -2171,6 +2198,7 @@ def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp,
     if res["actual"] is not None:
         LOG.info("  实际已公布   : %.2f（误差 %+.2f）", res["actual"], res["point"] - res["actual"])
     LOG.info("  说明：不输出 1/2 月拆分单月(人造噪声)；此为 1-2 月合并口径。")
+    _log_display_rule()
     LOG.info("=" * 70)
     return rec
 
@@ -2298,15 +2326,15 @@ def main(cfg: Config = CFG):
 
     # 9) 控制台总结
     LOG.info("=" * 70)
-    LOG.info("【预测结果】%s 工业增加值:规上:当月同比(1-2月拆分)", target_month.date())
+    LOG.info("【预测结果】%s 工业增加值:规上:当月同比(下个月=%d月，3-12月口径)",
+             target_month.date(), target_month.month)
     LOG.info("  点预测       : %.2f %%", point)
     for lv in cfg.interval_levels:
         lo, hi = intervals[lv]
         LOG.info("  %d%% 区间     : [%.2f, %.2f]", int(lv * 100), lo, hi)
     LOG.info("  各模型点预测 : %s",
              {k: (round(v.point, 2) if v else None) for k, v in per_model.items()})
-    if target_month.month in (1, 2):
-        LOG.info("  注意：1/2 月为拆分口径人造噪声，区间已自动加宽，置信度偏低。")
+    _log_display_rule()
     LOG.info("=" * 70)
     return rec
 

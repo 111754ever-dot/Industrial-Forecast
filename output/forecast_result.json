@@ -150,5 +150,12 @@
       }
     ],
     "note": "组合由 Autoregression/ElasticNet/DiffusionIndex/LightGBM/PartialLeastSquares/DynamicFactorModel 构成(权重 Autoregression=0.21, ElasticNet=0.20, DiffusionIndex=0.19, LightGBM=0.14, PartialLeastSquares=0.06, DynamicFactorModel=0.20)。其中 Autoregression/ElasticNet/DiffusionIndex/LightGBM/DynamicFactorModel 均【锚定 AR 惯性】，预测主要由【工业增加值自身历史的惯性(自回归/近期水平)】决定，高频/因子仅作受限的边际修正（经 DM 检验高频对 AR 无显著增量）；PartialLeastSquares 为【不锚 AR 的纯当月高频桥接】，凭误差去相关为组合提供少量多样化增益。"
+  },
+  "显示规则": {
+    "_说明": "显示口径按【数据汇总表自动检测的'下一个未发布月'】切换；下个月 = 最后一个当月同比月 + 1。",
+    "下个月=1月": "显示 \"-\"（国家统计局不单独发布 1 月工业增加值，故不预测）",
+    "下个月=2月": "显示【1-2月累计同比(合并值)】（Theta 法）",
+    "下个月=3至12月": "显示该月【当月同比】预测值（六模型集合）",
+    "本次命中": "下个月=5月(3-12月) → 显示该月【当月同比】预测值"
   }
 }
