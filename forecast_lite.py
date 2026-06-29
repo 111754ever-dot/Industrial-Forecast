@@ -1,0 +1,1872 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ 工业增加值（规上工业企业:当月同比，1-2月拆分）预测系统 —— 简洁版（单文件、自包含）
+================================================================================
+
+【本文件 = 完整版 industrial_va_forecast.py 的简洁版】：单文件、不依赖任何其他文件，
+输入数据汇总表即可直接运行。建模逻辑/口径/结果与完整版【完全一致】。
+
+与完整版的区别（只删"与显示结果无关"的内容，建模内核一字未改）：
+  · 运行后【只在控制台输出：点预测 + 80% 预测区间 + 结果说明】；
+  · 删除了：DM(Diebold-Mariano)检验、模型评估表、回测图/扇形图、数据质量报告、
+    各类 CSV/JSON 文件产出、95% 区间；
+  · 保留了产出"点预测+80%区间"所【必需】的：数据读取/校验、混频对齐、六模型集合、
+    真实时点无泄漏【回测】(提供组合权重与共形 80% 区间，故必须保留)、组合、Theta法。
+
+设计目标
+--------
+以"预测准确性"为唯一前提，提供：
+  1) 点预测；
+  2) 80% 预测区间。
+
+为何这样设计（与方案一一对应）
+--------------------------------
+* 频率不一致：四种频率全部"对齐到月"，高频指标按"真实时点可得"聚合（均值/月末值/
+  月内进度），避免前视偏差。
+* 样本长度不一致：**绝不截断到统一起止日期**（那样会被 2022 年才开始的指标拖到只剩
+  3 年样本，丢掉 30 年历史）。改用：真实时点(vintage)对齐 + 各模型按能力处理缺失
+  （AR 仅用目标自身；ARX 用"预测点可观测 + 训练覆盖充分"的高频，无需硬填）。
+* 1-2 月：拆分单月是人造噪声，回测/共形区间对 1-2 月单独分组(自动加宽)并单列其表现。
+* 既要点又要区间：逆误差加权组合点预测，区间用"对组合回测残差做分裂共形(split
+  conformal)校准"，力求经验覆盖达标且不过窄。
+* 模型集合（六类机制并存，提供方法学多样性。多数成员【锚定 AR 惯性】以避免纯高频模型的
+  系统性高估；组合提升的关键是【误差去相关】而非单体精度，故保留单体较弱但去相关的成员）：
+    - Autoregression      ：单变量自回归 AR(p)（基准/锚），BIC 定阶；
+    - ElasticNet          ：自回归滞后 + 高频外生的弹性网回归（时序CV），线性桥接；
+    - DiffusionIndex      ：扩散指数 / 因子增广回归（AR滞后 + 高频PCA因子, 岭回归），Stock-Watson 2002；
+    - LightGBM            ：锚定 + 梯度提升残差（非线性）；
+    - PartialLeastSquares ：纯当月高频桥接（偏最小二乘，【不锚自回归惯性】），误差与其余模型仅~0.3相关；
+    - DynamicFactorModel  ：混频动态因子（DynamicFactorMQ 状态空间 Kalman 因子 + 锚定AR岭回归），
+                            发挥混频/ragged-edge 优势，单体回测最佳之一。
+  另：1-2月口径单独处理——见下"1-2月合并"说明。
+  组合：六模型全部纳入【逆 MSE^2 加权】，弱模型自然降权(不做基准门控/DM检验——见说明)。
+  说明：经无泄漏回测，高频指标对自回归基准无显著增量；故多数成员锚定自回归惯性、仅让
+  高频/因子作受限边际修正，彼此印证、机制互补。【本文件为简洁版：在完整版基础上删除了
+  DM检验、评估表、回测图/扇形图、各类文件产出等"与显示结果无关"的内容，只保留产出
+  "点预测 + 80%区间 + 结果说明"所必需的:数据对齐、六模型、回测(供权重+共形区间)、组合。】
+
+1-2 月口径（统一产出按目标月切换）
+--------------------------------
+国家统计局对工业增加值【不单独发布 1 月、2 月】，而是把 1-2 月合并、于 3 月中旬一起公布；
+"拆分单月"是数据商重构的人造噪声、结构上近乎不可预测。故本系统【按数据汇总表自动检测的
+"下一个未发布月"切换显示口径】(下个月 = 最后一个当月同比月 + 1)：
+  * 下个月 3-12 月：显示该月【当月同比】（上面的六模型集合）；输出 display=数值。
+  * 下个月 1 月    ：1 月不单独发布、不预测，显示 "-"；输出 display="-"。
+  * 下个月 2 月    ：显示【1-2 月累计同比(合并)】——经"标准方法竞赛
+    (RW/ARIMA/ETS/Theta)+高频桥接检验"实证：Theta 法(M3竞赛公认方法)在累计同比序列上与
+    最优的随机游走几乎等价、优于 ARIMA/ETS，且为【单一公认模型】(既避免裸RW"结转去年"
+    的观感，也避免 RW+ARIMA+Theta 三法因高度相关而冗余)。故 1-2 月合并采用 Theta 法
+    （statsmodels ThetaModel），区间为高斯(近年误差RMSE为σ)。实现见 forecast_janfeb_combined()。
+
+真实时点（ragged edge）口径
+--------------------------
+在每月 20-25 日预测"下一个未发布月" T 时，信息集为：
+  - 工业增加值(目标)：发布到 T-1（T 未发布，正是要预测的）；
+  - 月度宏观自变量(社零/投资/PPI/PMI…)：发布到 T-1（次月中旬才发布 T）；
+  - 高频(日/周/旬)：基本覆盖到 T 月底。
+本系统用"参考期末 + 发布滞后 pub_lag_days <= as_of"统一判定每个观测是否可见，
+回测与实盘使用完全相同的可见性规则，据此避免前视偏差、保持训练/测试口径一致。
+
+运行
+----
+    python industrial_va_forecast.py
+产出在 ./output/ ：点+区间预测表、回测评估表、扇形图、驱动分解、数据质量报告。
+
+依赖
+----
+    numpy pandas openpyxl scipy statsmodels scikit-learn lightgbm matplotlib
+
+作者注
+------
+代码以"正确、规范、可常态化复用"为标准撰写，不以运行速度为目标。每个模型都做了
+异常隔离：单个模型失败不会中断整条流水线（会记录并在组合中自动剔除）。
+================================================================================
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import logging
+import warnings
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ==============================================================================
+# 第 0 节  日志
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
+LOG = logging.getLogger("IVA")
+
+
+# ==============================================================================
+# 第 1 节  全局配置
+# ==============================================================================
+@dataclass
+class Config:
+    # ---- 输入 ----
+    excel_path: str = "数据汇总表0620V4.xlsx"
+    sheet_target: str = "工业增加值"
+    sheet_month: str = "月度"
+    sheet_tenday: str = "旬度"
+    sheet_week: str = "周度"
+    sheet_day: str = "日度"
+    # 【累计同比】列名(在"工业增加值"sheet里，与当月同比并列)。仅用于 1-2 月口径(见下)。
+    ytd_col: str = "中国:工业增加值:规模以上工业企业:累计同比"
+
+    # ---- 真实时点口径（预测时点不写死，按汇总表采集日自动确定）----
+    # 业务：每月不固定的某天收集最新汇总表后预测【下一个未发布月】。
+    #   run_date  = 各 sheet 最新观测日期的最大值(=实际采集日)；
+    #   asof_gap_days = run_date − 目标月起点 的天数(采集时点相对目标月的位置)。
+    # 预测月 T 的 as_of = T 月起点 + asof_gap_days。对实盘目标月，该 as_of 恰等于 run_date，
+    # 【与采集月是否等于目标月无关】(例:6月5日预测5月, gap=35, as_of=6月5日, 正确)。
+    # 回测各历史月用同一 gap，随采集时间自动平移、不写死。None 时自动从数据推断。
+    run_date: Optional[str] = None          # 如 "2026-05-25"；None=自动取数据最新日期
+    asof_gap_days: Optional[int] = None     # None=自动取 run_date−目标月起点；由 main() 解析
+    # 各频率"真实发布滞后"（数据及时更新，故按每个频率的实际可得延迟分别设定，而非笼统取值）
+    pub_lag_target_days: int = 16    # 工业增加值发布滞后（次月约 15-16 日，NBS）
+    pub_lag_month_days: int = 16     # 月度宏观【默认】发布滞后（社零/投资/发电/产量 15-17日）。
+    #   注：发布更早的月度指标用 Indicator.pub_lag_days 单独覆盖，不走此默认：
+    #   PMI 家族=1天(NBS月末即发布)、PPI/PPIRM=9天(约次月9-10日)。详见指标字典。
+    pub_lag_day_days: int = 1        # 日度发布滞后（BDI/价格/港口吞吐/商品房，基本当天-次日）
+    pub_lag_week_days: int = 4       # 周度发布滞后（开工率/煤耗/乘用车，~3-5天）
+    pub_lag_tenday_days: int = 6     # 旬度发布滞后（中钢协钢铁旬报，~5-7天）
+
+    # ---- 回测 ----
+    backtest_months: int = 48        # 回测的外推月数（从最近往前）。生产可调大。
+    backtest_min_train: int = 120    # 回测起步所需的最少训练月数
+    dfm_refit_every: int = 6         # DFM 每隔多少个月重估一次参数（其余月复用参数仅滤波，提速）
+
+    # ---- 特征工程 ----
+    feature_lags: tuple = (1, 2, 3)  # 月度特征滞后阶
+    target_ar_lags: tuple = (1, 2, 3, 12)  # 目标自回归滞后
+
+    # ---- 抗过拟合 ----
+    # 桥接模型(ARX)的训练窗口上限(月)。限定近 N 年，避免：(1)被中位数填充的远古高频
+    # 特征污染；(2)1990年代/疫情等结构断点造成的体制错配。DFM 不受此限(它原生吃缺失、
+    # 且因子估计受益于长历史)。156 月 = 13 年，覆盖绝大多数高频指标的真实起点。
+    max_train_months: int = 156
+    bridge_topk_features: int = 40   # 桥接模型入模前按|相关|预筛的特征数(降维抗过拟合)
+    ensemble_exclude_janfeb_in_weights: bool = True  # 组合权重按"剔除1-2月"误差计算
+    ensemble_weight_power: float = 2.0  # 权重=1/RMSE^power。2=逆MSE,更狠地压制不稳定模型
+
+    # ---- 模型集合 ----
+    # 组合集合(当月同比口径): Autoregression + ElasticNet + DiffusionIndex + LightGBM +
+    # PartialLeastSquares + DynamicFactorModel。前三者误差高度相关(0.87-0.97)、多样性已饱和；
+    # 后三者(LightGBM
+    # 与 PLS 提供去相关增量（PLS 不锚AR、误差仅0.3相关，凭去相关改善组合）。
+    enable_probe_models: bool = True     # 纳入 LightGBM（锚定+GBM残差，非线性）
+    enable_pls: bool = True              # 纳入 PLS（纯当月高频桥接, 不锚AR, 去相关多样性）
+    pls_components: int = 2              # PLS 成分数（小，抗过拟合）
+    enable_dfm: bool = True              # 纳入 MF-DFM（状态空间Kalman因子+锚定AR岭回归）
+    # MF-DFM 因子的【精选核心序列】(长、与工业生产直接相关：发电/景气/价格/钢铁/产量/汽车/
+    # 需求)。刻意只用约10条而非全部41条核心列——这是控过拟合的关键(旧DFM用全集→载荷不稳)。
+    dfm_core_series: tuple = ("power_yoy", "pmi", "pmi_neworder", "pmi_newexport",
+                              "ppi_yoy", "retail_yoy", "prod_ic", "prod_power_equip",
+                              "steel_crude_key", "steel_rolled_key", "car_wholesale")
+
+    # ---- 1-2 月口径(累计同比合并值, Theta 法) ----
+    # 国家统计局对 1、2 月工业增加值不单独发布、合并于 3 月中旬公布；拆分单月是人造噪声。
+    # 故目标月为 1 或 2 月时，改为预测【1-2 月累计同比(合并)】，模型用 Theta 法
+    # (statsmodels ThetaModel，作用于累计同比序列)——经标准方法竞赛实证：与最优的随机游走
+    # 几乎等价、优于 ARIMA/ETS，且为单一公认模型(详见 forecast_janfeb_combined)。
+    janfeb_break_years: tuple = (2020, 2021)  # 结构断裂年(COVID)：从区间校准残差中剔除，避免区间被极值撑爆
+    janfeb_calib_window: int = 12             # 区间校准只用最近 N 年残差(贴合当前增速regime，不被高增长期撑宽)
+
+    # ---- 兜底/护栏 ----
+    # 注：简洁版【不做基准门控/DM检验】(完整版门控默认即关闭、弱模型由逆MSE^2加权自然降权，
+    # DM 仅用于报告)，故已移除 benchmark_name / ensemble_gate_models / dm_significance 等。
+    janfeb_fallback_k: int = 6       # 1-2月兜底:用最近K个非1-2月观测均值
+    sanity_clip_pp: float = 6.0      # 极端值护栏:最终点预测不超出近12个月实际范围±该值
+
+    # ---- 模型 ----
+    dfm_factors: int = 2             # DI 的 PCA 共同因子个数
+    dfm_maxiter: int = 100           # MF-DFM 的 EM 迭代上限
+    enet_l1_ratios: tuple = (0.1, 0.5, 0.7, 0.9, 0.95, 1.0)  # ARX 弹性网 l1_ratio 网格
+
+    # ---- 区间 ----
+    interval_levels: tuple = (0.80,)   # 简洁版仅输出 80% 区间
+
+    # ---- 输出详尽度 ----
+    # False(默认)=静默：控制台仅打印【最终结果 + 80%区间 + 说明】；True=打印完整过程日志(调试)。
+    verbose: bool = False
+
+    # ---- 杂项 ----
+    random_state: int = 20260624
+
+
+CFG = Config()
+
+
+# ------------------------------------------------------------------------------
+# 1.1  指标字典（含"同名陷阱"核对）
+# ------------------------------------------------------------------------------
+# 每条登记：
+#   key      : 内部短名（唯一）
+#   name     : Excel 中的**精确**列名（一字不差，用于校验，防止对方更新表时改名/换序）
+#   sheet    : 所属频率 sheet
+#   transform: 变换类型，见 第 4 节 Transformer
+#               - 'target'      目标，已是当月同比，保持
+#               - 'yoy_keep'    已是同比/累计同比，保持
+#               - 'cum2mom2yoy' 累计值 -> 当月值 -> 当月同比（年初处理 1-2 月合并）
+#               - 'level2yoy'   水平量(产量/吞吐/销量/面积) -> 月度聚合 -> 当月同比
+#               - 'index2yoy'   价格/指数 -> 月度聚合 -> 同比
+#               - 'rate'        比率(PMI/开工率/运转率/发运率) -> 月度聚合 -> 保持水平
+#   agg      : 高频->月度聚合方式 'mean'（默认）；月度指标用 'last'
+#   dfm_tier : 是否纳入 MF-DFM 的"长且完整"核心集合（很新/很稀疏的剔除，仅供 ML）
+#   role     : 'target' / 'predictor'
+#   note     : 备注（重点标注易混项）
+#   pub_lag_days : 该指标的【真实发布滞后(天)】覆盖；None=用所属 sheet 的默认滞后。
+#                  用于个别"比同 sheet 默认更早可得"的指标(如 PMI 月末即发布、PPI 约次月9日)，
+#                  使回测可见性贴近真实历史可得性，并对预测时点变化(早/晚于常规)保持正确。
+# ------------------------------------------------------------------------------
+@dataclass
+class Indicator:
+    key: str
+    name: str
+    sheet: str
+    transform: str
+    agg: str = "mean"
+    dfm_tier: bool = True
+    role: str = "predictor"
+    note: str = ""
+    pub_lag_days: Optional[int] = None
+
+
+def build_indicator_dict(cfg: Config) -> list[Indicator]:
+    M, T, W, D = cfg.sheet_month, cfg.sheet_tenday, cfg.sheet_week, cfg.sheet_day
+    TG = cfg.sheet_target
+    inds = [
+        # ===== 目标 =====
+        Indicator("IVA_yoy", "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)", TG,
+                  "target", "last", True, "target",
+                  "目标：1-2月【拆分】口径，与社零的【合并】口径不同，勿混用"),
+        # 累计同比：仅供【1-2月合并(Theta法)】流程使用(见 forecast_janfeb_combined)，
+        # 角色 'ytd_aux' 使其【不进入 3-12 月当月同比模型/面板】；登记于此仅为通过列名校验、
+        # 并写入指标字典文档(避免被误报为"额外未使用列")。
+        Indicator("IVA_ytd", cfg.ytd_col, TG, "yoy_keep", "last", False, "ytd_aux",
+                  "工业增加值【累计同比】；仅用于 1-2 月合并预测，不参与当月同比模型"),
+
+        # ===== 月度 =====
+        Indicator("retail_yoy", "中国:社会消费品零售总额:当月同比(1-2月合并)", M,
+                  "yoy_keep", "last", True, "predictor",
+                  "1-2月【合并】口径；与目标拆分口径不同，1/2月对齐需谨慎"),
+        Indicator("fai_cum", "中国:固定资产投资完成额:累计值", M,
+                  "cum2mom2yoy", "last", True, "predictor",
+                  "累计值(YTD)：先还原当月值再算当月同比；勿当水平值；1月空、2月为1-2合并"),
+        Indicator("reinv_cum", "中国:房地产开发投资完成额:累计值", M,
+                  "cum2mom2yoy", "last", True, "predictor",
+                  "累计值(YTD)：同上还原；与固投累计值是两条近名指标，勿混"),
+        Indicator("pmi", "中国:制造业PMI", M, "rate", "last", True, "predictor",
+                  "荣枯线50；NBS当月末即发布，滞后≈1天(非16)", pub_lag_days=1),
+        Indicator("pmi_neworder", "中国:制造业PMI:新订单", M, "rate", "last", True, "predictor",
+                  "PMI 子项-新订单，勿与下面新出口订单混；随PMI月末发布", pub_lag_days=1),
+        Indicator("pmi_newexport", "中国:制造业PMI:新出口订单", M, "rate", "last", True, "predictor",
+                  "PMI 子项-新出口订单；随PMI月末发布", pub_lag_days=1),
+        Indicator("power_yoy", "中国:发电量:当月同比", M, "yoy_keep", "last", True, "predictor",
+                  "发电量当月同比，与工业生产高度同步"),
+        Indicator("ppi_yoy", "中国:PPI:当月同比", M, "yoy_keep", "last", True, "predictor",
+                  "NBS约次月9-10日发布，滞后≈9天(早于社零/投资)", pub_lag_days=9),
+        Indicator("ppirm_yoy", "中国:PPIRM:当月同比", M, "yoy_keep", "last", True, "predictor",
+                  "PPIRM(生产资料购进价)，勿与 PPI 混；随PPI约次月9日发布", pub_lag_days=9),
+        Indicator("pmi_rawprice", "中国:制造业PMI:主要原材料购进价格", M, "rate", "last", True,
+                  "predictor", "PMI 价格子项；随PMI月末发布", pub_lag_days=1),
+        Indicator("prod_ic", "中国:产量:集成电路:当月值", M, "level2yoy", "last", True, "predictor",
+                  "当月值水平量 -> 同比"),
+        Indicator("prod_power_equip", "中国:产量:发电设备:当月值", M, "level2yoy", "last", True,
+                  "predictor", "当月值水平量 -> 同比"),
+
+        # ===== 旬度（聚合到月，3旬/月）=====
+        Indicator("steel_crude_key", "中国:日均产量:粗钢:重点企业", T, "level2yoy", "mean", True,
+                  "predictor", "重点企业粗钢日均产量；勿与下面'预估日均产量:粗钢'混"),
+        Indicator("steel_crude_est", "中国:预估日均产量:粗钢", T, "level2yoy", "mean", True,
+                  "predictor", "全国预估粗钢日均产量（不同来源）"),
+        Indicator("steel_rolled_key", "中国:日均产量:钢材:重点企业", T, "level2yoy", "mean", True,
+                  "predictor", "重点企业钢材日均产量"),
+        Indicator("steel_pig_key", "中国:日均产量:生铁:重点企业", T, "level2yoy", "mean", True,
+                  "predictor", "重点企业生铁日均产量"),
+
+        # ===== 周度 =====
+        Indicator("util_tire_semi", "中国:开工率:汽车轮胎(半钢胎)", W, "rate", "mean", True,
+                  "predictor", "半钢胎；与全钢胎成对近名，勿混"),
+        Indicator("util_tire_full", "中国:开工率:汽车轮胎(全钢胎)", W, "rate", "mean", True,
+                  "predictor", "全钢胎"),
+        Indicator("util_pet_chip", "中国:开工率:聚酯切片", W, "rate", "mean", True, "predictor", ""),
+        Indicator("util_asphalt", "中国:开工率:石油沥青装置", W, "rate", "mean", True, "predictor", ""),
+        Indicator("prod_rebar_mill", "中国:产量:螺纹钢:主要钢厂", W, "level2yoy", "mean", True,
+                  "predictor", "主要钢厂螺纹钢产量(水平量->同比)"),
+        Indicator("util_rebar_mill", "中国:开工率:螺纹钢:主要钢厂", W, "rate", "mean", True,
+                  "predictor", "螺纹钢开工率(比率)；与上面螺纹钢产量是两条不同指标"),
+        Indicator("land_area_100", "中国:100大中城市:成交土地占地面积", W, "level2yoy", "mean", True,
+                  "predictor", "成交土地面积(水平量->同比)；地产前瞻"),
+        Indicator("scfi", "中国:上海出口集装箱运价指数:综合指数", W, "index2yoy", "mean", True,
+                  "predictor", "SCFI 运价指数->同比"),
+        Indicator("steel_price_idx", "中国:钢材综合价格指数", W, "index2yoy", "mean", True,
+                  "predictor", "钢材综合价格指数->同比"),
+        Indicator("coal_south_plant", "中国:南方电厂:日耗量:煤炭", W, "level2yoy", "mean", False,
+                  "predictor", "2022年才有：剔出DFM核心集，仅供ML"),
+        Indicator("coal_key_plant", "中国:日耗量:煤炭重点电厂", W, "level2yoy", "mean", False,
+                  "predictor", "2022年才有：仅供ML；与统调/南方电厂三条近名，勿混"),
+        Indicator("coal_unified_plant", "中国:日耗量:煤炭统调电厂", W, "level2yoy", "mean", False,
+                  "predictor", "2022年才有：仅供ML"),
+        Indicator("car_retail", "中国:日均销量(当周,厂家零售):乘用车", W, "level2yoy", "mean", True,
+                  "predictor", "乘用车厂家【零售】；与下面【批发】成对近名，勿混"),
+        Indicator("car_wholesale", "中国:日均销量(当周,厂家批发):乘用车", W, "level2yoy", "mean", True,
+                  "predictor", "乘用车厂家【批发】"),
+        Indicator("cement_ship", "中国:发运率:水泥", W, "rate", "mean", True, "predictor", "水泥发运率(比率)"),
+        Indicator("mill_run", "中国:运转率:磨机", W, "rate", "mean", True, "predictor", "磨机运转率(比率)"),
+        Indicator("util_poly_loom", "中国:江浙地区:开工率:涤纶长丝:下游织机", W, "rate", "mean", True,
+                  "predictor", "下游织机开工率；与下面涤纶长丝本体成对近名，勿混"),
+        Indicator("util_poly", "中国:江浙地区:开工率:涤纶长丝", W, "rate", "mean", True,
+                  "predictor", "涤纶长丝开工率"),
+        Indicator("bf_tangshan", "中国:唐山:高炉开工率", W, "rate", "mean", True, "predictor",
+                  "唐山高炉开工率"),
+
+        # ===== 日度 =====
+        Indicator("util_pta", "中国:开工率:精对苯二甲酸", D, "rate", "mean", True, "predictor",
+                  "PTA 开工率(比率)"),
+        Indicator("house_sale_30", "中国:30大中城市:成交面积:商品房", D, "level2yoy", "mean", True,
+                  "predictor", "30城商品房成交面积(水平量->同比)；地产需求高频"),
+        Indicator("bdi", "波罗的海干散货指数(BDI)", D, "index2yoy", "mean", True, "predictor",
+                  "BDI 干散货运价->同比"),
+        Indicator("nh_index", "南华综合指数", D, "index2yoy", "mean", True, "predictor",
+                  "南华商品综合指数->同比"),
+        Indicator("rebar_price", "中国:价格:螺纹钢(HRB400E,20mm)", D, "index2yoy", "mean", True,
+                  "predictor", "螺纹钢现货价->同比"),
+        Indicator("cement_price_idx", "中国:水泥价格指数", D, "index2yoy", "mean", True,
+                  "predictor", "水泥价格指数->同比"),
+        Indicator("port_qhd", "中国:秦皇岛港:港口吞吐量:煤炭", D, "level2yoy", "mean", True,
+                  "predictor", "秦皇岛港煤炭吞吐量(水平量->同比)；与曹妃甸/京唐三港近名，勿混"),
+        Indicator("port_cfd", "中国:曹妃甸港:煤炭调度:港口吞吐量", D, "level2yoy", "mean", True,
+                  "predictor", "曹妃甸港煤炭吞吐量"),
+        Indicator("port_jt", "中国:京唐老港:港口吞吐量:煤炭", D, "level2yoy", "mean", True,
+                  "predictor", "京唐老港煤炭吞吐量"),
+    ]
+    return inds
+
+
+# ------------------------------------------------------------------------------
+# 1.2  春节日期表（春节正月初一），1990-2030
+# ------------------------------------------------------------------------------
+SPRING_FESTIVAL = {
+    1990: "1990-01-27", 1991: "1991-02-15", 1992: "1992-02-04", 1993: "1993-01-23",
+    1994: "1994-02-10", 1995: "1995-01-31", 1996: "1996-02-19", 1997: "1997-02-07",
+    1998: "1998-01-28", 1999: "1999-02-16", 2000: "2000-02-05", 2001: "2001-01-24",
+    2002: "2002-02-12", 2003: "2003-02-01", 2004: "2004-01-22", 2005: "2005-02-09",
+    2006: "2006-01-29", 2007: "2007-02-18", 2008: "2008-02-07", 2009: "2009-01-26",
+    2010: "2010-02-14", 2011: "2011-02-03", 2012: "2012-01-23", 2013: "2013-02-10",
+    2014: "2014-01-31", 2015: "2015-02-19", 2016: "2016-02-08", 2017: "2017-01-28",
+    2018: "2018-02-16", 2019: "2019-02-05", 2020: "2020-01-25", 2021: "2021-02-12",
+    2022: "2022-02-01", 2023: "2023-01-22", 2024: "2024-02-10", 2025: "2025-01-29",
+    2026: "2026-02-17", 2027: "2027-02-06", 2028: "2028-01-26", 2029: "2029-02-13",
+    2030: "2030-02-03",
+}
+
+
+# ==============================================================================
+# 第 2 节  通用工具
+# ==============================================================================
+def month_end(ts) -> pd.Timestamp:
+    """返回所在月的月末时间戳。"""
+    ts = pd.Timestamp(ts)
+    return ts + pd.offsets.MonthEnd(0)
+
+
+def to_month_index(idx) -> pd.DatetimeIndex:
+    """把任意日期索引归一到月末。"""
+    return pd.DatetimeIndex([month_end(t) for t in idx])
+
+
+def safe_yoy(s: pd.Series) -> pd.Series:
+    """月度序列的 12 月同比（百分比）。s 需为月末索引、按月连续。
+    去年同月为 0 或符号反转会产生 inf/异常，这里把 inf 置为 NaN（交由下游缺失处理）。
+    """
+    s = s.astype(float)
+    base = s.shift(12)
+    yoy = (s / base - 1.0) * 100.0
+    yoy = yoy.replace([np.inf, -np.inf], np.nan)
+    return yoy
+
+
+# ==============================================================================
+# 第 3 节  数据读取与列名校验
+# ==============================================================================
+class DataLoader:
+    """读取 Excel 各 sheet，校验列名是否与指标字典完全一致（防对方更新表时改名/换序）。"""
+
+    def __init__(self, cfg: Config, indicators: list[Indicator]):
+        self.cfg = cfg
+        self.indicators = indicators
+        self.raw: dict[str, pd.DataFrame] = {}
+        self.report: dict[str, list] = {"missing_columns": [], "extra_columns": [], "ok": []}
+
+    def load(self) -> dict[str, pd.DataFrame]:
+        cfg = self.cfg
+        if not os.path.exists(cfg.excel_path):
+            raise FileNotFoundError(f"找不到数据文件：{cfg.excel_path}")
+        xl = pd.ExcelFile(cfg.excel_path)
+        LOG.info("Excel sheets: %s", xl.sheet_names)
+
+        for sheet in [cfg.sheet_target, cfg.sheet_month, cfg.sheet_tenday,
+                      cfg.sheet_week, cfg.sheet_day]:
+            if sheet not in xl.sheet_names:
+                raise ValueError(f"缺少 sheet：{sheet}")
+            df = xl.parse(sheet)
+            df.columns = [str(c).strip() for c in df.columns]
+            datecol = df.columns[0]
+            df[datecol] = pd.to_datetime(df[datecol], errors="coerce")
+            df = df.dropna(subset=[datecol]).sort_values(datecol).reset_index(drop=True)
+            df = df.rename(columns={datecol: "date"})
+            # 数值化
+            for c in df.columns:
+                if c != "date":
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            self.raw[sheet] = df
+
+        self._validate()
+        return self.raw
+
+    def _validate(self):
+        """逐指标核对精确列名是否存在。"""
+        for ind in self.indicators:
+            df = self.raw.get(ind.sheet)
+            if df is None or ind.name not in df.columns:
+                self.report["missing_columns"].append((ind.sheet, ind.key, ind.name))
+                LOG.error("【列名校验失败】sheet=%s 缺少列：%s（内部名 %s）",
+                          ind.sheet, ind.name, ind.key)
+            else:
+                self.report["ok"].append((ind.sheet, ind.key, ind.name))
+        # 多出来的列（提示，不报错）
+        used = {}
+        for ind in self.indicators:
+            used.setdefault(ind.sheet, set()).add(ind.name)
+        for sheet, df in self.raw.items():
+            for c in df.columns:
+                if c == "date":
+                    continue
+                if c not in used.get(sheet, set()):
+                    self.report["extra_columns"].append((sheet, c))
+
+        n_missing = len(self.report["missing_columns"])
+        if n_missing > 0:
+            raise RuntimeError(
+                f"列名校验未通过：有 {n_missing} 个指标在表中找不到精确列名。"
+                f"很可能是数据提供方更新表时改了名称或调整了列。请核对指标字典与最新表。"
+            )
+        LOG.info("列名校验通过：%d 个指标全部匹配；额外未使用列 %d 个。",
+                 len(self.report["ok"]), len(self.report["extra_columns"]))
+
+
+# ==============================================================================
+# 第 4 节  变换（按口径平稳化）
+# ==============================================================================
+class Transformer:
+    """把每个原始指标转换为"与目标同比口径可比、且尽量平稳"的【原始频率】序列。
+
+    注意：此处只做"口径变换"，不做频率聚合（聚合在第 5 节按真实时点进行）。
+    对于需要同比的高频水平量/价格，这里**不**直接做同比（因为高频同比需先聚合到月），
+    只在月度指标上直接完成同比；高频的 'level2yoy'/'index2yoy' 标记会被第 5 节识别为
+    "先月度聚合再做月度同比"。
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    # ---- 累计值 -> 当月值 -> 当月同比（月度专用）----
+    @staticmethod
+    def cum_to_mom(s: pd.Series) -> pd.Series:
+        """累计值(YTD)还原为当月值。规则：同年内 当月值 = 累计(M) - 累计(M-1)；
+        每年 1 月(或年内首个非空月)直接等于累计值本身。
+        中国数据 1 月通常缺、2 月为 1-2 月合并 -> 2 月当月值即为该合并值（保留合并口径）。
+        """
+        s = s.astype(float).copy()
+        out = pd.Series(index=s.index, dtype=float)
+        for year, grp in s.groupby(s.index.year):
+            grp = grp.sort_index()
+            prev = None
+            for ts, v in grp.items():
+                if np.isnan(v):
+                    out[ts] = np.nan
+                    prev = prev  # 跳过缺失，prev 不变
+                    continue
+                if prev is None:
+                    out[ts] = v          # 年内首个非空累计值即当月(或1-2合并)值
+                else:
+                    out[ts] = v - prev
+                prev = v
+        return out
+
+    def transform_monthly(self, s: pd.Series, transform: str) -> pd.Series:
+        """月度指标的口径变换，返回月末索引的平稳序列。"""
+        s = s.copy()
+        s.index = to_month_index(s.index)
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        # 补齐为月连续索引（缺失保留 NaN，供下游模型处理）
+        full = pd.date_range(s.index.min(), s.index.max(), freq="ME")
+        s = s.reindex(full)
+
+        if transform in ("target", "yoy_keep", "rate"):
+            return s
+        if transform == "cum2mom2yoy":
+            mom = self.cum_to_mom(s)
+            return safe_yoy(mom)
+        if transform in ("level2yoy", "index2yoy"):
+            return safe_yoy(s)
+        raise ValueError(f"未知 transform: {transform}")
+
+
+# ==============================================================================
+# 第 5 节  混频对齐（真实时点 / 参差边缘）
+# ==============================================================================
+class FrequencyAligner:
+    """把所有频率对齐到"月末"，并严格按 as_of 信息集构造特征，避免前视偏差。
+
+    核心方法 build_monthly_panel(as_of)：
+      给定评估时点 as_of，对每个指标只用"参考期末 + 发布滞后 <= as_of"的观测，
+      聚合到月，得到该时点真实可见的月度面板（含目标）。
+    """
+
+    def __init__(self, cfg: Config, raw: dict[str, pd.DataFrame],
+                 indicators: list[Indicator]):
+        self.cfg = cfg
+        self.raw = raw
+        self.indicators = indicators
+        self.transformer = Transformer(cfg)
+        # 预抽取每个指标的 (date, value) 原始长表
+        self._series: dict[str, pd.Series] = {}
+        for ind in indicators:
+            df = raw[ind.sheet]
+            s = df.set_index("date")[ind.name].dropna()
+            self._series[ind.key] = s
+
+    def _pub_lag_days(self, ind: Indicator) -> int:
+        cfg = self.cfg
+        # 个别指标的真实滞后与所属 sheet 默认不同 -> 用指标级覆盖(如 PMI 月末即发布)。
+        if ind.pub_lag_days is not None:
+            return int(ind.pub_lag_days)
+        if ind.role == "target":
+            return cfg.pub_lag_target_days
+        if ind.sheet == cfg.sheet_month:
+            return cfg.pub_lag_month_days
+        if ind.sheet == cfg.sheet_day:
+            return cfg.pub_lag_day_days
+        if ind.sheet == cfg.sheet_week:
+            return cfg.pub_lag_week_days
+        if ind.sheet == cfg.sheet_tenday:
+            return cfg.pub_lag_tenday_days
+        return cfg.pub_lag_week_days   # 兜底
+
+    def _visible_raw(self, ind: Indicator, as_of: pd.Timestamp,
+                     apply_pub_lag: bool = True) -> pd.Series:
+        """返回 as_of 时点可见的原始序列。
+
+        apply_pub_lag=True（回测）：参考期末 + 发布滞后 <= as_of，重建历史可得性、防未来泄漏。
+        apply_pub_lag=False（实盘）：参考期末 <= as_of 即可——自动更新表"出现即可得"，
+          不应再按假定滞后删除表中已存在的数据。
+        """
+        s = self._series[ind.key]
+        if apply_pub_lag:
+            lag = pd.Timedelta(days=self._pub_lag_days(ind))
+            visible_mask = (s.index + lag) <= as_of
+        else:
+            visible_mask = s.index <= as_of
+        return s[visible_mask]
+
+    def _aggregate_highfreq_to_month(self, s: pd.Series, agg: str) -> pd.Series:
+        """高频 -> 月度聚合。agg='mean' 取月内可见均值（参差月即为部分月均值）。"""
+        s = s.copy()
+        s.index = pd.DatetimeIndex(s.index)
+        grouper = s.groupby(to_month_index(s.index))
+        if agg == "mean":
+            return grouper.mean()
+        if agg == "last":
+            return grouper.last()
+        if agg == "sum":
+            return grouper.sum()
+        raise ValueError(agg)
+
+    def _highfreq_monthly_yoy(self, vis: pd.Series) -> pd.Series:
+        """高频水平量/价格 -> 月度【同口径(MTD)同比】。
+
+        完整历史月用整月同比(向量化)；只有【最后一个(残)月】用 MTD 同口径同比
+        ——拿今年该月已覆盖到的最大日 day<=cap 窗口 ÷ 去年同月同一窗口，消除"残月均值÷
+        去年整月均值"的口径偏差。任一 vintage 面板里只有当月是残月，故仅需修正末月，O(月数)。
+        """
+        s = vis.copy()
+        s.index = pd.DatetimeIndex(s.index)
+        df = pd.DataFrame({"v": s.astype(float).values}, index=s.index)
+        df["month"] = to_month_index(df.index)
+        df["dom"] = df.index.day
+        monthly_mean = df.groupby("month")["v"].mean().sort_index()
+        if len(monthly_mean) == 0:
+            return pd.Series(dtype=float)
+        # 完整月：整月同比(向量化)
+        full_idx = pd.date_range(monthly_mean.index.min(),
+                                 monthly_mean.index.max(), freq="ME")
+        mm = monthly_mean.reindex(full_idx)
+        yoy = (mm / mm.shift(12) - 1.0) * 100.0
+        # 末月若残缺(覆盖日<28)则改用 MTD 同口径同比
+        last = monthly_mean.index.max()
+        cap = int(df.loc[df["month"] == last, "dom"].max())
+        if cap < 28:
+            prior = month_end(pd.Timestamp(last) - pd.DateOffset(years=1))
+            pm = df[(df["month"] == prior) & (df["dom"] <= cap)]["v"]
+            cur = df[(df["month"] == last) & (df["dom"] <= cap)]["v"]
+            base = pm.mean()
+            if len(pm) > 0 and len(cur) > 0 and np.isfinite(base) and abs(base) > 1e-12:
+                yoy.loc[last] = (cur.mean() / base - 1.0) * 100.0
+            else:
+                yoy.loc[last] = np.nan
+        return yoy.replace([np.inf, -np.inf], np.nan)
+
+    def build_monthly_panel(self, as_of: pd.Timestamp,
+                            apply_pub_lag: bool = True) -> pd.DataFrame:
+        """构造 as_of 时点的月度面板（列=指标内部名，行=月末），含目标列。
+        apply_pub_lag=False 时用全表可得性（实盘：表中出现即可得）。"""
+        cfg = self.cfg
+        cols = {}
+        for ind in self.indicators:
+            # 仅【目标】与【预测变量】进入当月同比面板；辅助列(如累计同比 role='ytd_aux')
+            # 只为列名校验/字典文档登记，不参与当月同比模型，故跳过。
+            if ind.role not in ("target", "predictor"):
+                continue
+            vis = self._visible_raw(ind, as_of, apply_pub_lag)
+            if len(vis) == 0:
+                continue
+            if ind.sheet == cfg.sheet_month or ind.role == "target":
+                # 月度/目标：直接口径变换
+                ser = self.transformer.transform_monthly(vis, ind.transform)
+            else:
+                # 高频：按口径做"月度同口径(MTD)同比 / 保持比率"
+                if ind.transform in ("level2yoy", "index2yoy"):
+                    ser = self._highfreq_monthly_yoy(vis)  # 同口径(MTD)同比，消除残月偏差
+                    if ser.notna().any():
+                        full = pd.date_range(ser.index.min(), ser.index.max(), freq="ME")
+                        ser = ser.reindex(full)
+                elif ind.transform == "rate":
+                    monthly = self._aggregate_highfreq_to_month(vis, ind.agg)
+                    monthly.index = to_month_index(monthly.index)
+                    ser = monthly[~monthly.index.duplicated(keep="last")].sort_index()
+                else:
+                    raise ValueError(f"高频指标 {ind.key} 不应是 transform={ind.transform}")
+            cols[ind.key] = ser
+
+        panel = pd.DataFrame(cols)
+        panel = panel.sort_index()
+        panel = panel.replace([np.inf, -np.inf], np.nan)  # 兜底清洗非有限值
+        panel.index.name = "date"
+        return panel
+
+
+# ==============================================================================
+# 第 6 节  春节特征
+# ==============================================================================
+def spring_festival_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """为给定月末索引构造春节相关特征（应对 1-2 月拆分口径的人造波动）。
+
+    特征：
+      sf_in_jan / sf_in_feb : 当年春节是否落在 1/2 月（哑变量，仅 1、2 月行非零）
+      sf_offset_days        : 春节日相对 2 月 1 日的偏移天数（错位强度，1、2 月行）
+      sf_this_month         : 当月是否为春节所在月（春节当月=1，否则=0）
+      month_1 / month_2     : 1 月、2 月哑变量（拆分口径基数效应）
+    """
+    rows = []
+    for ts in index:
+        y, m = ts.year, ts.month
+        sf = SPRING_FESTIVAL.get(y, None)
+        sf_month = pd.Timestamp(sf).month if sf else None
+        sf_day_offset = ((pd.Timestamp(sf) - pd.Timestamp(f"{y}-02-01")).days
+                         if sf else 0.0)
+        rows.append({
+            "sf_in_jan": 1.0 if (m == 1 and sf_month == 1) else 0.0,
+            "sf_in_feb": 1.0 if (m == 2 and sf_month == 2) else 0.0,
+            "sf_offset_days": float(sf_day_offset) if m in (1, 2) else 0.0,
+            "sf_this_month": 1.0 if (sf_month == m) else 0.0,
+            "month_1": 1.0 if m == 1 else 0.0,
+            "month_2": 1.0 if m == 2 else 0.0,
+        })
+    return pd.DataFrame(rows, index=index)
+
+
+# ==============================================================================
+# 第 7 节  特征矩阵（供 ARX 与 LightGBM 等桥接模型使用）
+# ==============================================================================
+class FeatureBuilder:
+    """由月度面板构造监督学习特征矩阵：滞后、目标自回归、基数、春节。"""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def build(self, panel: pd.DataFrame, target_key: str = "IVA_yoy") -> pd.DataFrame:
+        cfg = self.cfg
+        feat = pd.DataFrame(index=panel.index)
+        # 目标列可能在很早的月份(目标尚不可见)缺失 -> 用全 NaN 兜底，避免 KeyError
+        y = panel[target_key] if target_key in panel.columns \
+            else pd.Series(np.nan, index=panel.index)
+
+        # 预测变量列（除目标）
+        pred_cols = [c for c in panel.columns if c != target_key]
+
+        # 1) 高频/预测变量：当期(month T，nowcasting核心)与滞后
+        for c in pred_cols:
+            feat[f"{c}_t0"] = panel[c]
+            for L in cfg.feature_lags:
+                feat[f"{c}_l{L}"] = panel[c].shift(L)
+
+        # 2) 目标自回归滞后
+        for L in cfg.target_ar_lags:
+            feat[f"y_l{L}"] = y.shift(L)
+
+        # 3) 基数效应（去年同月目标值）
+        feat["y_base_l12"] = y.shift(12)
+
+        # 4) 春节 / 月份特征
+        sf = spring_festival_features(panel.index)
+        for c in sf.columns:
+            feat[c] = sf[c]
+
+        feat["__target__"] = y
+        feat = feat.replace([np.inf, -np.inf], np.nan)  # 兜底清洗
+        return feat
+
+
+# ==============================================================================
+# 第 8 节  模型
+# ==============================================================================
+@dataclass
+class Prediction:
+    point: float
+    lower: dict = field(default_factory=dict)   # {level: value}
+    upper: dict = field(default_factory=dict)
+    sigma: Optional[float] = None               # 模型自报的标准差（若有）
+    extra: dict = field(default_factory=dict)
+
+
+class BaseModel:
+    name = "base"
+
+    def predict_asof(self, target_month: pd.Timestamp, as_of: pd.Timestamp,
+                     ctx: "Context") -> Optional[Prediction]:
+        raise NotImplementedError
+
+
+# ------------------------------------------------------------------------------
+# 8.1  DI（扩散指数 / 因子增广回归，Stock-Watson 2002）
+# ------------------------------------------------------------------------------
+class ModelDI(BaseModel):
+    """扩散指数(Diffusion Index, Stock-Watson 2002) / 因子增广回归：非1-2月目标 ~ AR滞后 + 高频指标的【主成分因子(PCA)】，
+    岭回归(TimeSeriesSplit 定参，无泄漏)。
+
+    设计要点（解决纯高频/原DFM"系统高估"的问题）：
+      - 【锚定 AR 惯性】：AR 滞后强制入模，高频因子仅作边际增量，故不会被高频带跑而高估；
+      - 【机制独特】：用 PCA 从高频面板提取共同因子（与 ARX 的弹性网选特征不同），提供方法
+        学多样性，是公认的 Stock-Watson 扩散指数预测法；
+      - 1-2月退化为近期均值。
+    """
+    name = "DiffusionIndex"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            p = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
+        if des is None:
+            return None
+        Xtr, ytr, Xte, cols, med = des
+        arl = [c for c in cols if c.startswith("arlag")]
+        hf = [c for c in cols if not c.startswith("arlag")]
+        if not arl:
+            return None
+        try:
+            if len(hf) >= 3:
+                sc = StandardScaler()
+                Ztr = sc.fit_transform(Xtr[hf].values); Zte = sc.transform(Xte[hf].values)
+                r = int(min(cfg.dfm_factors, Ztr.shape[1], max(1, len(ytr) // 20)))
+                pca = PCA(n_components=r)
+                Ftr = pca.fit_transform(Ztr); Fte = pca.transform(Zte)
+                Dtr = np.hstack([Xtr[arl].values, Ftr]); Dte = np.hstack([Xte[arl].values, Fte])
+            else:
+                Dtr = Xtr[arl].values; Dte = Xte[arl].values
+            sc2 = StandardScaler()
+            Dtr_s = sc2.fit_transform(Dtr); Dte_s = sc2.transform(Dte)
+            ns = max(2, min(5, len(ytr) // 12))
+            ridge = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0, 1000.0], cv=TimeSeriesSplit(ns))
+            ridge.fit(Dtr_s, ytr.values)
+            point = float(ridge.predict(Dte_s)[0])
+            sigma = float(np.std(ytr.values - ridge.predict(Dtr_s), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            return out
+        except Exception as e:
+            LOG.warning("DI 在 %s 失败：%s", target_month.date(), e)
+            return None
+# ------------------------------------------------------------------------------
+# 8.3  LightGBM（锚定 + 梯度提升残差，非线性混合）
+# ------------------------------------------------------------------------------
+class ModelLGB(BaseModel):
+    """锚定 + 梯度提升残差：以"近期非1-2月均值"为锚，对【目标 − 锚】的残差用 LightGBM 做
+    受限非线性修正（修正幅度截断在 ±2pp）。
+
+    设计要点（解决纯 ML"系统高估"的问题）：
+      - 【锚定近期水平】：基线是近期实际均值，GBM 只解释残差，故不会被高频/基数带跑而高估；
+      - 【非线性机制】：GBM 原生处理缺失、捕捉非线性/交互，提供 AR/线性模型之外的方法学多样性；
+      - 1-2月退化为锚。
+    """
+    name = "LightGBM"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        import lightgbm as lgb
+        cfg = self.cfg
+        feat = ctx.realtime_feature_matrix()  # 真实时点矩阵:训练/预测信息集一致
+        if target_month not in feat.index:
+            return None
+        nf = ~feat.index.month.isin([1, 2])
+        ytar = feat["__target__"]; ynf = ytar[nf]
+        anchor = ynf.shift(1).rolling(cfg.janfeb_fallback_k, min_periods=3).mean()
+        anchor = anchor.reindex(feat.index).ffill()
+        aT = anchor.loc[target_month]
+        if not np.isfinite(aT):
+            return None
+        if target_month.month in (1, 2):
+            out = Prediction(point=float(aT))
+            _gauss_interval(out, float(aT), float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        # 残差 = 目标 − 锚（仅非1-2月）；高频特征对残差做受限非线性修正
+        resid = ytar - anchor
+        tr = feat.index[nf & (feat.index < target_month) & resid.notna() & anchor.notna()]
+        if len(tr) > cfg.max_train_months:
+            tr = tr[-cfg.max_train_months:]
+        if len(tr) < cfg.backtest_min_train // 2:
+            return None
+        hf = [c for c in feat.columns if c != "__target__" and not c.startswith("y_")]
+        Xtr = feat.loc[tr, hf]; ytr = resid.loc[tr]; Xte = feat.loc[[target_month], hf]
+        params = dict(
+            n_estimators=200, learning_rate=0.03, num_leaves=8, max_depth=3,
+            min_child_samples=30, min_split_gain=0.02, subsample=0.7, subsample_freq=1,
+            colsample_bytree=0.5, reg_lambda=5.0, reg_alpha=2.0,
+            random_state=cfg.random_state, n_jobs=-1, verbose=-1,
+        )
+        try:
+            m = lgb.LGBMRegressor(objective="regression", **params)
+            m.fit(Xtr.values, ytr.values)
+            corr = float(np.clip(m.predict(Xte.values)[0], -2.0, 2.0))  # 受限残差修正
+            point = float(aT) + corr
+            sigma = float(np.std(ytr.values - m.predict(Xtr.values), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["importance"] = dict(
+                zip(hf, m.booster_.feature_importance(importance_type="gain")))
+            out.extra["anchor"] = round(float(aT), 3)
+            out.extra["nl_correction"] = round(corr, 3)
+            return out
+        except Exception as e:
+            LOG.warning("LightGBM 在 %s 失败：%s", target_month.date(), e)
+            return None
+def _target_history(ctx, as_of, target_month, drop_janfeb=True):
+    """取 as_of 可见的目标历史（到 T-1）。drop_janfeb=True 则剔除 1-2 月。"""
+    panel = ctx.aligner.build_monthly_panel(as_of)
+    if "IVA_yoy" not in panel.columns:
+        return None
+    y = panel["IVA_yoy"].dropna()
+    y = y.loc[:target_month]
+    if target_month in y.index:
+        y = y.drop(target_month)
+    if drop_janfeb:
+        y = y[~y.index.month.isin([1, 2])]
+    return y
+
+
+def _gauss_interval(out: Prediction, point, sigma, cfg):
+    from scipy.stats import norm
+    out.sigma = sigma
+    if sigma is not None and np.isfinite(sigma) and sigma > 0:
+        for lv in cfg.interval_levels:
+            z = norm.ppf(0.5 + lv / 2)
+            out.lower[lv] = point - z * sigma
+            out.upper[lv] = point + z * sigma
+
+
+def _nonjf_supervised_design(ctx, cfg, target_month, n_arlags=3,
+                             include_arlags=True, topk=None):
+    """为【非1-2月】监督桥接模型(ARX/PLS)构造无泄漏设计矩阵。
+
+    要点：
+      - 仅用【非1-2月】行(避免1-2月人造噪声污染)；
+      - AR 滞后用【非1-2月子序列】的滞后(arlag1..p)，而非日历上月(后者对3月会取到2月噪声)；
+      - 高频特征：只取在预测点【可观测】且训练覆盖充分的列，按|相关|取 top-K(仅训练段算)；
+      - 排除日历 y_* 特征(可能含1-2月污染)，AR 信息统一由干净的 arlag 提供；
+      - 测试行缺失用【训练集】中位数填补。
+    返回 (Xtr, ytr, Xte, cols, med) 或 None。
+    """
+    feat = ctx.realtime_feature_matrix()
+    if target_month not in feat.index:
+        return None
+    nf_idx = feat.index[~feat.index.month.isin([1, 2])]
+    if target_month not in nf_idx:
+        return None
+    ytar = feat["__target__"]
+    ynf = ytar.loc[nf_idx]
+    lagdf = pd.DataFrame(index=nf_idx)
+    if include_arlags:
+        for L in range(1, n_arlags + 1):
+            lagdf[f"arlag{L}"] = ynf.shift(L)
+    hf_cols = [c for c in feat.columns
+               if c != "__target__" and not c.startswith("y_")]
+    test_row = feat.loc[target_month]
+    train_idx = nf_idx[(nf_idx < target_month) & ytar.loc[nf_idx].notna()]
+    if len(train_idx) > cfg.max_train_months:
+        train_idx = train_idx[-cfg.max_train_months:]
+    if len(train_idx) < 30:
+        return None
+    min_cov = max(24, len(train_idx) // 3)
+    ytr = ytar.loc[train_idx]
+    cand = [c for c in hf_cols if pd.notna(test_row[c])
+            and feat.loc[train_idx, c].notna().sum() >= min_cov]
+    corr = {}
+    for c in cand:
+        v = feat.loc[train_idx, c]
+        m = v.notna() & ytr.notna()
+        if m.sum() >= 24 and v[m].std() > 1e-9:
+            corr[c] = abs(np.corrcoef(v[m], ytr[m])[0, 1])
+    k = topk or cfg.bridge_topk_features
+    top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                reverse=True)[:k]]
+    design = pd.concat([feat.loc[nf_idx, top], lagdf], axis=1)
+    Xtr_raw = design.loc[train_idx]
+    Xte_raw = design.loc[[target_month]]
+    # AR 滞后在预测点必须可得(否则该模型不适用)
+    if include_arlags and Xte_raw[list(lagdf.columns)].isna().any(axis=1).iloc[0]:
+        return None
+    if len(top) + len(lagdf.columns) < 3:
+        return None
+    med = Xtr_raw.median()
+    Xtr = Xtr_raw.fillna(med).fillna(0.0)
+    Xte = Xte_raw.fillna(med).fillna(0.0)
+    return Xtr, ytr, Xte, list(design.columns), med
+
+
+# ------------------------------------------------------------------------------
+# 8.4b  AR(p)（自回归，基准）——平稳自相关序列的标准技能下限
+# ------------------------------------------------------------------------------
+class ModelAR(BaseModel):
+    """对【非1-2月】目标子序列拟合 AR(p)，阶数由 BIC 选择(无CV、无泄漏)。
+
+    比"近期均值"更标准、更严格的基准：显式建模惯性/均值回复。
+    1-2月退化为近期均值。
+    """
+    name = "Autoregression"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from statsmodels.tsa.ar_model import AutoReg, ar_select_order
+        cfg = self.cfg
+        ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+        if ynf is None or len(ynf) < 30:
+            return None
+        vals = ynf.values.astype(float)
+        try:
+            if target_month.month in (1, 2):
+                point = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+                sigma = float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1))
+            else:
+                maxlag = int(min(12, max(1, len(vals) // 6)))
+                try:
+                    sel = ar_select_order(vals, maxlag=maxlag, ic="bic",
+                                          old_names=False)
+                    lags = sel.ar_lags if sel.ar_lags is not None and len(sel.ar_lags) else 1
+                except Exception:
+                    lags = 1
+                res = AutoReg(vals, lags=lags, old_names=False).fit()
+                point = float(np.asarray(res.predict(start=len(vals),
+                                                     end=len(vals)))[0])
+                sigma = float(np.sqrt(res.sigma2))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            return out
+        except Exception as e:
+            LOG.warning("AR 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4c  ARX（AR 滞后 + 高频外生，正则化 + 时序CV，无泄漏）
+# ------------------------------------------------------------------------------
+class ModelARX(BaseModel):
+    """ARX：非1-2月 AR 滞后 + 高频外生回归，ElasticNet 正则、TimeSeriesSplit 定参。
+    嵌套 AR(惯性锚)，公平检验高频在惯性之上的增量价值。1-2月退化为近期均值。"""
+    name = "ElasticNet"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.linear_model import ElasticNetCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        if target_month.month in (1, 2):
+            ynf = _target_history(ctx, as_of, target_month, drop_janfeb=True)
+            if ynf is None or len(ynf) < 6:
+                return None
+            point = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=point)
+            _gauss_interval(out, point, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        des = _nonjf_supervised_design(ctx, cfg, target_month, include_arlags=True)
+        if des is None:
+            return None
+        Xtr, ytr, Xte, cols, med = des
+        try:
+            sc = StandardScaler()
+            Xtr_s = sc.fit_transform(Xtr.values)
+            Xte_s = sc.transform(Xte.values)
+            model = ElasticNetCV(l1_ratio=list(cfg.enet_l1_ratios),
+                                 cv=TimeSeriesSplit(5), max_iter=50000,
+                                 n_jobs=-1, random_state=cfg.random_state)
+            model.fit(Xtr_s, ytr.values)
+            point = float(model.predict(Xte_s)[0])
+            sigma = float(np.std(ytr.values - model.predict(Xtr_s), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["n_nonzero"] = int(np.sum(model.coef_ != 0))
+            order = np.argsort(-np.abs(model.coef_))
+            out.extra["coef_top"] = [
+                {"feature": cols[i], "coef": round(float(model.coef_[i]), 3)}
+                for i in order[:10] if model.coef_[i] != 0]
+            return out
+        except Exception as e:
+            LOG.warning("ARX 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4d  PLS（纯当月高频桥接 nowcast，偏最小二乘，【不锚定AR】——为组合提供去相关多样性）
+# ------------------------------------------------------------------------------
+class ModelPLS(BaseModel):
+    """偏最小二乘(PLS)高频桥接 nowcast：非1-2月目标 ~ 仅【当月可观测高频(_t0)】，
+    PLS 提取与目标最相关的监督成分，【刻意不含任何 AR 滞后】。
+
+    存在意义（经诊断实验确认）：AR/ARX/DI 误差两两相关高达 0.87-0.97（皆锚定 AR 惯性），
+    多样性已近饱和。本模型从【纯当月高频、无惯性锚】的不同角度切入，误差与现有模型仅
+    0.3 相关——虽单体 RMSE 较高，但并入组合后凭【去相关】降低组合方差(回测 1.204->1.168)。
+      - 与 DI 的区别：DI 用 PCA(无监督因子)+AR 锚；本模型用 PLS(监督成分)且无 AR 锚；
+      - 受小权重(逆MSE^2)与极端值护栏保护，不会因偶发噪声主导结果；
+      - 1-2月退化为近期非1-2月均值，与其他模型一致。
+    """
+    name = "PartialLeastSquares"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.cross_decomposition import PLSRegression
+        from sklearn.preprocessing import StandardScaler
+        cfg = self.cfg
+        feat = ctx.realtime_feature_matrix()
+        if target_month not in feat.index:
+            return None
+        ytar = feat["__target__"]
+        nf = feat.index[~feat.index.month.isin([1, 2])]
+        if target_month.month in (1, 2):
+            ynf = ytar.loc[nf].dropna()
+            ynf = ynf[ynf.index < target_month]
+            if len(ynf) < 6:
+                return None
+            p = float(ynf.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        # 仅当月高频(_t0)、排除目标自回归 y_* 与春节哑变量——纯 nowcast 信号、无 AR 锚
+        hf_t0 = [c for c in feat.columns if c.endswith("_t0")
+                 and not c.startswith("y_") and "__" not in c]
+        test_row = feat.loc[target_month]
+        train_idx = nf[(nf < target_month) & ytar.loc[nf].notna()]
+        if len(train_idx) > cfg.max_train_months:
+            train_idx = train_idx[-cfg.max_train_months:]
+        if len(train_idx) < 36:
+            return None
+        ytr = ytar.loc[train_idx]
+        min_cov = max(24, len(train_idx) // 3)
+        cand = [c for c in hf_t0 if pd.notna(test_row[c])
+                and feat.loc[train_idx, c].notna().sum() >= min_cov]
+        corr = {}
+        for c in cand:
+            v = feat.loc[train_idx, c]; mk = v.notna() & ytr.notna()
+            if mk.sum() >= 24 and v[mk].std() > 1e-9:
+                corr[c] = abs(np.corrcoef(v[mk], ytr[mk])[0, 1])
+        top = [c for c, _ in sorted(corr.items(), key=lambda kv: kv[1],
+                                    reverse=True)[:cfg.bridge_topk_features]]
+        if len(top) < 5:
+            return None
+        Xtr = feat.loc[train_idx, top]; Xte = feat.loc[[target_month], top]
+        med = Xtr.median()
+        Xtr = Xtr.fillna(med).fillna(0.0); Xte = Xte.fillna(med).fillna(0.0)
+        try:
+            sc = StandardScaler()
+            Xs = sc.fit_transform(Xtr.values); Xe = sc.transform(Xte.values)
+            nc = int(min(cfg.pls_components, Xs.shape[1], max(1, len(ytr) // 30)))
+            pls = PLSRegression(n_components=max(1, nc))
+            pls.fit(Xs, ytr.values)
+            point = float(pls.predict(Xe).ravel()[0])
+            sigma = float(np.std(ytr.values - pls.predict(Xs).ravel(), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["n_features"] = len(top)
+            out.extra["n_components"] = max(1, nc)
+            return out
+        except Exception as e:
+            LOG.warning("PLS 在 %s 失败：%s", target_month.date(), e)
+            return None
+
+
+# ------------------------------------------------------------------------------
+# 8.4e  MF-DFM（混频动态因子模型：状态空间Kalman因子 + 锚定AR岭回归）
+# ------------------------------------------------------------------------------
+class ModelMFDFM(BaseModel):
+    """混频动态因子模型（重写版）：用 statsmodels DynamicFactorMQ 的【状态空间 Kalman
+    滤波】从精选核心序列提取单一共同因子，再以当月滤波因子 f_T 作回归量、【锚定 AR 惯性】
+    做岭回归得到目标。
+
+    相对旧 DFM(系统高估+过拟合被剔除)的三处修正：
+      - 【不让因子自行外推】：因子只作边际增量，锚定 AR 滞后 -> 消除系统性高估
+        (回测 bias 从大正偏降到≈0)；
+      - 【发挥混频/ragged-edge 优势】：Kalman 滤波天然吸收"当月残月高频+目标未发布"的
+        参差边缘，优于 DI 的"中位数填充+PCA"(这是 DFM 真正的价值所在)；
+      - 【控过拟合】：单因子、仅约10条长核心序列、Ridge收缩、滚动训练窗、每 K 月重估EM
+        参数(其余月仅用固定参数滤波)。
+    1-2月退化为近期非1-2月均值，与其他模型一致。
+    """
+    name = "DynamicFactorModel"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._params = None          # 缓存的 EM 参数
+        self._anchor_month = None    # 上次重估参数的目标月（按 refit 周期复用）
+        self._param_cols = None      # 上次重估时的列签名（列集变化则不可复用参数）
+
+    def _factor(self, as_of, target_month, ctx):
+        """提取核心序列(含目标)的单一【滤波】共同因子序列(实时正确：每月仅用≤该月数据)。
+
+        健壮性：DynamicFactorMQ(standardize=True) 会按各列在可见窗口的 std 标准化——若某列
+        在该 vintage 窗口里观测过少或近零方差，标准化会产生 inf/NaN 使 EM 报错。故先清洗
+        inf、剔除"观测<36 或近零方差"的列；并按列签名缓存参数(列集变化时强制重估，避免用
+        旧参数滤波维度不符的新模型)。
+        """
+        from statsmodels.tsa.statespace.dynamic_factor_mq import DynamicFactorMQ
+        cfg = self.cfg
+        panel = ctx.aligner.build_monthly_panel(as_of)   # vintage：当月IAV=NaN, 高频=残月
+        cols = ["IVA_yoy"] + [c for c in cfg.dfm_core_series if c in panel.columns]
+        X = panel.loc[panel.index <= month_end(target_month), cols].copy()
+        X = X.replace([np.inf, -np.inf], np.nan)
+        X = X.loc[X.dropna(how="all").index.min():]
+        # 剔除可见窗口内观测过少 / 近零方差的列（否则标准化->inf/NaN，EM 失败）。目标列恒留。
+        keep = [c for c in X.columns
+                if c == "IVA_yoy"
+                or (X[c].notna().sum() >= 36 and X[c].std(skipna=True) > 1e-8)]
+        X = X[keep]
+        if "IVA_yoy" not in X.columns or X.shape[1] < 3 or len(X) < 72:
+            return None
+        # 主路径：状态空间 Kalman 因子。EM 偶发数值不稳定(optimizer 进入非有限区)时，
+        # 降级为 PCA 因子(有限、实时安全)，保证不丢该月、不打印告警。
+        try:
+            mod = DynamicFactorMQ(X, factors=1, factor_orders=1,
+                                  idiosyncratic_ar1=True, standardize=True)
+            sig = tuple(X.columns)   # 列签名：与缓存参数的列集一致才可复用
+            ai = self._anchor_month
+            reuse = (self._params is not None and ai is not None
+                     and self._param_cols == sig
+                     and 0 <= (target_month.to_period("M") - ai.to_period("M")).n
+                     < cfg.dfm_refit_every)
+            if reuse:
+                try:
+                    res = mod.smooth(self._params)
+                except Exception:
+                    res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
+                    self._params, self._anchor_month, self._param_cols = \
+                        res.params, target_month, sig
+            else:
+                res = mod.fit(maxiter=cfg.dfm_maxiter, disp=False)
+                self._params, self._anchor_month, self._param_cols = \
+                    res.params, target_month, sig
+            # 提取共同因子序列：不同 statsmodels 版本属性名不同，做兼容回退。
+            # states.smoothed 为 Kalman 平滑因子(仅用≤as_of数据，实时安全)。
+            if hasattr(res, "factors_filtered"):
+                fac = np.asarray(res.factors_filtered.iloc[:, 0])
+            else:
+                fac = np.asarray(res.states.smoothed.iloc[:, 0])
+            if np.all(np.isfinite(fac)):
+                return pd.Series(fac, index=X.index)
+        except Exception as e:
+            LOG.debug("MF-DFM EM 在 %s 数值不稳定，降级为PCA因子：%s", target_month.date(), e)
+        return self._pca_factor(X)
+
+    @staticmethod
+    def _pca_factor(X: pd.DataFrame) -> Optional[pd.Series]:
+        """降级因子：核心面板按列标准化(均值/标准差)+均值填补后取第一主成分。
+
+        作为 EM 数值不稳定时的兜底——产出有限、仅用窗口内(≤as_of)数据，实时安全；后续锚定
+        Ridge 回归会吸收其符号/尺度，故与 Kalman 因子可无缝替换。
+        """
+        from sklearn.decomposition import PCA
+        Z = X.replace([np.inf, -np.inf], np.nan).astype(float)
+        sd = Z.std(ddof=0).replace(0.0, np.nan)
+        Z = (Z - Z.mean()) / sd
+        Z = Z.fillna(0.0).replace([np.inf, -np.inf], 0.0)   # 标准化后缺失=均值=0
+        try:
+            f = PCA(n_components=1).fit_transform(Z.values).ravel()
+            if np.all(np.isfinite(f)):
+                return pd.Series(f, index=X.index)
+        except Exception:
+            pass
+        return None
+
+    def predict_asof(self, target_month, as_of, ctx) -> Optional[Prediction]:
+        from sklearn.linear_model import RidgeCV
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import TimeSeriesSplit
+        cfg = self.cfg
+        ynf_vis = _target_history(ctx, as_of, target_month, drop_janfeb=True)  # 到 T-1
+        if ynf_vis is None or len(ynf_vis) < 6:
+            return None
+        if target_month.month in (1, 2):
+            p = float(ynf_vis.tail(cfg.janfeb_fallback_k).mean())
+            out = Prediction(point=p)
+            _gauss_interval(out, p, float(ynf_vis.tail(cfg.janfeb_fallback_k).std(ddof=1)), cfg)
+            return out
+        fseries = self._factor(as_of, target_month, ctx)
+        if fseries is None:
+            return None
+        tm = month_end(target_month)
+        # 把目标月加入索引(其 y 未知=NaN)，避免对最新一期取不到设计行
+        ynf = pd.concat([ynf_vis, pd.Series({tm: np.nan})])
+        ynf = ynf[~ynf.index.duplicated()].sort_index()
+        design = pd.DataFrame(index=ynf.index)
+        design["arlag1"] = ynf.shift(1)
+        design["arlag2"] = ynf.shift(2)
+        design["factor"] = fseries.reindex(ynf.index)
+        design["y"] = ynf
+        tr = design[design.index < tm].dropna()
+        if len(tr) > cfg.max_train_months:
+            tr = tr.iloc[-cfg.max_train_months:]
+        if len(tr) < 48:
+            return None
+        te = design.loc[[tm], ["arlag1", "arlag2", "factor"]]
+        if te.isna().any(axis=1).iloc[0]:
+            return None
+        try:
+            sc = StandardScaler()
+            Xtr = sc.fit_transform(tr[["arlag1", "arlag2", "factor"]].values)
+            Xte = sc.transform(te.values)
+            ns = max(2, min(5, len(tr) // 12))
+            ridge = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0, 1000.0],
+                            cv=TimeSeriesSplit(ns))
+            ridge.fit(Xtr, tr["y"].values)
+            point = float(ridge.predict(Xte)[0])
+            sigma = float(np.std(tr["y"].values - ridge.predict(Xtr), ddof=1))
+            out = Prediction(point=point)
+            _gauss_interval(out, point, sigma, cfg)
+            out.extra["factor_T"] = round(float(fseries.loc[tm]), 3)
+            return out
+        except Exception as e:
+            LOG.warning("MF-DFM 在 %s 失败：%s", target_month.date(), e)
+            return None
+# ==============================================================================
+# 第 9 节  上下文（按 as_of 缓存对齐面板与特征，避免重复计算）
+# ==============================================================================
+class Context:
+    """承载对齐器与特征构造器，并对 as_of 结果做缓存（同一 as_of 多模型共享）。"""
+
+    def __init__(self, cfg: Config, aligner: FrequencyAligner, fb: FeatureBuilder):
+        self.cfg = cfg
+        self.aligner = aligner
+        self.fb = fb
+        # 缓存键为 (as_of, apply_pub_lag) 二元组，区分"按发布滞后过滤"与"全表可得"两种面板。
+        self._panel_cache: dict[tuple, pd.DataFrame] = {}
+        self._rt_feat: Optional[pd.DataFrame] = None
+        # 实盘采集时点：该 as_of 用【全表(无pub_lag)】面板("自动更新表出现即可得")。由 main() 设置。
+        self.live_as_of: Optional[pd.Timestamp] = None
+
+    def panel_asof(self, as_of: pd.Timestamp,
+                   apply_pub_lag: bool = True) -> pd.DataFrame:
+        # 经由已包装(带缓存+实盘覆盖)的 aligner.build_monthly_panel 取面板。
+        return self.aligner.build_monthly_panel(as_of, apply_pub_lag=apply_pub_lag)
+
+    def realtime_feature_matrix(self) -> pd.DataFrame:
+        """【真实时点(vintage)特征矩阵】——修复 ARX/LGB 训练与预测信息集不一致。
+
+        每一行 m 都用"在 as_of(m)=m月起点+asof_gap_days 能看到的数据"构造(panel@as_of_m)：
+          - 当月 m 高频=残月(到约19日)、月度宏观当月值=未发布(NaN)；
+          - 过去月份 m-1, m-2…=完整可见；目标滞后=已发布部分。
+        于是【训练行与预测行具有完全相同的可得性结构】，消除"训练用完整月、预测用残月"
+        的信息集不一致。该矩阵与"何时运行"无关(行 m 只依赖 m 自身的 as_of)，故全局构建
+        一次并缓存，回测各步与实盘共享、且天然无前视。
+        """
+        if self._rt_feat is not None:
+            return self._rt_feat
+        # 用一个很晚的 as_of 取到完整月份索引范围 + 已实现目标值
+        full = self.aligner.build_monthly_panel(pd.Timestamp("2100-01-01"))
+        months = [m for m in full.index]
+        rows = []
+        for m in months:
+            as_of_m = asof_for_target(self.cfg, m)
+            panel_m = self.panel_asof(as_of_m)
+            feat_m = self.fb.build(panel_m)
+            if m in feat_m.index:
+                rows.append(feat_m.loc[[m]])
+        rt = pd.concat(rows).sort_index()
+        # 关键：特征保持 vintage，但【标签 __target__ 必须用已实现的真实目标值】
+        # (vintage 行的当月目标未发布=NaN，不能当训练标签；其余 y 滞后特征仍是 vintage)
+        rt["__target__"] = full["IVA_yoy"].reindex(rt.index)
+        # 注：实盘目标月那一行，其 as_of(目标月)==ctx.live_as_of，缓存代理对它强制用【全表
+        # (无pub_lag)面板】，故实盘行天然用"表中已可得数据"(而非按假定滞后过滤后的数据)。
+        self._rt_feat = rt
+        LOG.info("已构建真实时点(vintage)特征矩阵：%s", rt.shape)
+        return self._rt_feat
+
+
+# 把 aligner.build_monthly_panel 包一层缓存，使所有模型(经 ctx.aligner)复用面板、避免重复构造。
+def _wire_context_cache(ctx: Context):
+    """为 aligner.build_monthly_panel 安装缓存代理。
+
+    要点(修复两处隐患)：
+      (1) 保留 apply_pub_lag 参数——包装后仍可显式传 apply_pub_lag=False；
+      (2) 缓存键为 (as_of, 生效的apply_pub_lag) 二元组——同一 as_of 的两种口径互不串味；
+      (3) 实盘覆盖：当 as_of == ctx.live_as_of 时，强制 apply_pub_lag=False(自动更新表"出现
+          即可得"，不按假定滞后删已存在数据)，使实盘行天然用"表中已可得数据"。
+    """
+    raw_build = ctx.aligner.build_monthly_panel   # 原始(未包装)方法
+
+    def cached(as_of, apply_pub_lag: bool = True):
+        eff = (False if (ctx.live_as_of is not None and as_of == ctx.live_as_of)
+               else apply_pub_lag)
+        key = (as_of, eff)
+        if key not in ctx._panel_cache:
+            ctx._panel_cache[key] = raw_build(as_of, apply_pub_lag=eff)
+        return ctx._panel_cache[key]
+
+    ctx.aligner.build_monthly_panel = cached
+
+
+# ==============================================================================
+# 第 10 节  真实时点工具：由"预测月"推出 as_of
+# ==============================================================================
+def infer_collection_date(raw: dict) -> pd.Timestamp:
+    """从汇总表推断采集日 = 各 sheet【有实际数据的行】的最新日期的最大值。
+
+    稳健性：只取"至少有一个指标值非空"的行的日期，**忽略预生成的未来空日期行**
+    （仅有日期、指标值全空）。否则空尾行会把采集日带偏、使预测时点提前/错位。
+    """
+    mx = None
+    for df in raw.values():
+        if "date" not in df.columns or len(df) == 0:
+            continue
+        value_cols = [c for c in df.columns if c != "date"]
+        if not value_cols:
+            continue
+        has_data = df[value_cols].notna().any(axis=1)   # 该行是否有任一指标值
+        if not has_data.any():
+            continue
+        d = pd.to_datetime(df.loc[has_data, "date"]).max()
+        mx = d if mx is None else max(mx, d)
+    if mx is None:
+        raise RuntimeError("无法从汇总表推断采集日：所有 sheet 均无非空指标值。")
+    return pd.Timestamp(mx)
+
+
+def resolve_asof_gap(cfg: Config, raw: dict, target_live: pd.Timestamp) -> int:
+    """确定 as_of 的间隔天数 = 采集日(run_date) − 目标月起点。
+
+    用"间隔"而非"当月第几天"，可正确处理"采集月≠目标月"(如6月5日预测5月)：
+    此时 gap = 35 天，as_of(5月) = 5月起点+35 = 6月5日 = 真实采集日。
+    """
+    if cfg.asof_gap_days is not None:
+        return int(cfg.asof_gap_days)
+    run = (pd.Timestamp(cfg.run_date) if cfg.run_date
+           else infer_collection_date(raw)).normalize()
+    start = pd.Timestamp(target_live.year, target_live.month, 1)
+    return int((run - start).days)
+
+
+def asof_for_target(cfg: Config, target_month: pd.Timestamp) -> pd.Timestamp:
+    """预测月 T 的评估时点 = T 月起点 + asof_gap_days（采集时点相对目标月的位置）。
+
+    asof_gap_days 不写死：由 main() 按【采集日 − 实盘目标月起点】解析并写回 cfg，随采集
+    时间自动平移；对实盘目标月该 as_of 恰为 run_date(与采集月是否等于目标月无关)。
+    若未解析(独立调用)回退 gap=22(≈当月23号)。回测与实盘同一规则，避免前视偏差。
+    """
+    tm = month_end(target_month)
+    gap = cfg.asof_gap_days if cfg.asof_gap_days is not None else 22
+    start = pd.Timestamp(tm.year, tm.month, 1)
+    return start + pd.Timedelta(days=int(gap))
+
+
+def true_target_value(raw: dict, cfg: Config, target_month: pd.Timestamp) -> Optional[float]:
+    """从原始表取目标月的真实工业增加值（用于回测对照；预测未来时返回 None）。"""
+    df = raw[cfg.sheet_target]
+    name = "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"
+    s = df.set_index("date")[name]
+    s.index = to_month_index(s.index)
+    tm = month_end(target_month)
+    if tm in s.index and pd.notna(s.loc[tm]):
+        return float(s.loc[tm])
+    return None
+
+
+# ==============================================================================
+# 第 11 节  回测引擎（伪真实时点，扩展窗口）
+# ==============================================================================
+class Backtester:
+    """对历史每个月做"伪真实时点"外推：仅用该月 as_of 可见信息，逐模型预测并评估。
+    产出每个模型的逐月预测、真实值、误差，供组合权重与共形区间使用。
+    """
+
+    def __init__(self, cfg: Config, ctx: Context, models: list[BaseModel],
+                 raw: dict):
+        self.cfg = cfg
+        self.ctx = ctx
+        self.models = models
+        self.raw = raw
+
+    def _target_months(self) -> list[pd.Timestamp]:
+        cfg = self.cfg
+        s = self.raw[cfg.sheet_target].set_index("date")[
+            "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
+        s.index = to_month_index(s.index)
+        s = s.sort_index()
+        all_months = list(s.index)
+        # 需要至少 backtest_min_train 个训练月
+        if len(all_months) <= cfg.backtest_min_train:
+            return []
+        candidates = all_months[cfg.backtest_min_train:]
+        return candidates[-cfg.backtest_months:]
+
+    def run(self) -> pd.DataFrame:
+        cfg = self.cfg
+        months = self._target_months()
+        LOG.info("回测区间：%s ~ %s 共 %d 个月",
+                 months[0].date() if months else None,
+                 months[-1].date() if months else None, len(months))
+        records = []
+        for i, tm in enumerate(months):
+            as_of = asof_for_target(cfg, tm)
+            y_true = true_target_value(self.raw, cfg, tm)
+            rec = {"target_month": tm, "as_of": as_of, "y_true": y_true,
+                   "is_jan_feb": tm.month in (1, 2)}
+            for mdl in self.models:
+                try:
+                    pred = mdl.predict_asof(tm, as_of, self.ctx)
+                except Exception as e:
+                    LOG.warning("%s 在 %s 抛异常：%s", mdl.name, tm.date(), e)
+                    pred = None
+                if pred is not None and np.isfinite(pred.point):
+                    rec[f"{mdl.name}__point"] = pred.point
+                    for lv in cfg.interval_levels:
+                        rec[f"{mdl.name}__lo{int(lv*100)}"] = pred.lower.get(lv, np.nan)
+                        rec[f"{mdl.name}__hi{int(lv*100)}"] = pred.upper.get(lv, np.nan)
+                else:
+                    rec[f"{mdl.name}__point"] = np.nan
+            records.append(rec)
+            if (i + 1) % 6 == 0 or i == len(months) - 1:
+                LOG.info("  回测进度 %d/%d（最新 %s）", i + 1, len(months), tm.date())
+        return pd.DataFrame(records).set_index("target_month")
+# ==============================================================================
+# 第 13 节  组合（逆误差加权）+ 分裂共形区间
+# ==============================================================================
+class Ensemble:
+    """逆 MSE 加权组合点预测；对组合残差做分裂共形，生成 80% 区间。
+    1/2 月单独校准（其波动更大、区间应更宽）。
+    """
+
+    def __init__(self, cfg: Config, model_names: list[str]):
+        self.cfg = cfg
+        self.model_names = model_names
+        self.weights: dict[str, float] = {}
+        self.conformal_q: dict = {}   # {(level, group): half_width}
+
+    def fit(self, bt: pd.DataFrame):
+        cfg = self.cfg
+        y = bt["y_true"].values
+        jf = bt["is_jan_feb"].values
+        # 1) 计算各模型逆误差权重。默认按"剔除1-2月"误差计算——1-2月拆分值是不可预测
+        #    的人造噪声，若计入会让权重被噪声主导、奖励到对噪声偶然拟合的模型。
+        weight_mask_base = (~jf) if cfg.ensemble_exclude_janfeb_in_weights else np.ones_like(jf, bool)
+        # 短窗口稳健：有效月数过少时放宽门槛，避免直接失败
+        n_eff = int((np.isfinite(y) & weight_mask_base).sum())
+        min_obs = min(6, max(3, n_eff))
+        rmses = {}
+        for name in self.model_names:
+            col = f"{name}__point"
+            if col not in bt:
+                continue
+            p = bt[col].values
+            m = np.isfinite(y) & np.isfinite(p) & weight_mask_base
+            if m.sum() >= min_obs:
+                rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
+        if not rmses:
+            # 兜底：回测样本极少 -> 退化为基准(若有)或所有可用模型等权（仍继续算共形）
+            LOG.warning("回测有效样本不足(n_eff=%d)，退化为基准/等权组合。", n_eff)
+            avail = [n for n in self.model_names if f"{n}__point" in bt
+                     and bt[f"{n}__point"].notna().any()]
+            if not avail:
+                raise RuntimeError("没有任何模型产生有效回测预测，无法组合。")
+            self.weights = {k: 1.0 / len(avail) for k in avail}
+            LOG.info("组合权重(兜底,等权)：%s", self.weights)
+            return self._finalize_conformal(bt, cfg)
+
+        # 逆误差幂次加权（全部模型纳入）。
+        # 注：本简洁版【不做基准门控 / DM 检验】——完整版的门控默认即关闭(全部纳入)，弱模型
+        # 由逆 MSE^2 加权自然降权；DM 检验仅用于报告，对最终预测/区间无任何影响，故此处省略。
+        inv = {k: 1.0 / max(v, 1e-6) ** cfg.ensemble_weight_power
+               for k, v in rmses.items()}
+        ssum = sum(inv.values())
+        self.weights = {k: v / ssum for k, v in inv.items()}
+        LOG.info("组合权重：%s", {k: round(v, 3) for k, v in self.weights.items()})
+        return self._finalize_conformal(bt, cfg)
+
+    def _finalize_conformal(self, bt: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+        """组合点预测 + 分裂共形区间（1/2月与其他月分组校准）。"""
+        bt = bt.copy()
+        bt["ENSEMBLE__point"] = self.combine_points(bt)
+        resid = (bt["ENSEMBLE__point"] - bt["y_true"]).abs().values
+        grp = bt["is_jan_feb"].values
+        all_resid = resid[np.isfinite(resid)]
+        for lv in cfg.interval_levels:
+            for group, gmask in [("normal", ~grp), ("janfeb", grp)]:
+                r = resid[gmask & np.isfinite(resid)]
+                if len(r) >= 5:
+                    k = int(np.ceil((len(r) + 1) * lv))   # 分裂共形分位数(有限样本校正)
+                    k = min(k, len(r))
+                    q = np.sort(r)[k - 1]
+                elif len(all_resid) >= 1:
+                    q = float(np.nanquantile(all_resid, lv))  # 样本少时用全体残差兜底
+                else:
+                    q = np.nan
+                self.conformal_q[(lv, group)] = float(q)
+        LOG.info("共形半宽：%s", {f"{k[1]}@{int(k[0]*100)}": round(v, 2)
+                                   for k, v in self.conformal_q.items()})
+        return bt
+
+    def combine_points(self, bt: pd.DataFrame) -> np.ndarray:
+        num = np.zeros(len(bt))
+        den = np.zeros(len(bt))
+        for name, w in self.weights.items():
+            col = f"{name}__point"
+            if col not in bt:
+                continue
+            p = bt[col].values
+            m = np.isfinite(p)
+            num[m] += w * p[m]
+            den[m] += w
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out = np.where(den > 0, num / den, np.nan)
+        return out
+
+    def combine_single(self, preds: dict[str, Prediction]) -> Optional[float]:
+        num, den = 0.0, 0.0
+        for name, w in self.weights.items():
+            if name in preds and preds[name] is not None and np.isfinite(preds[name].point):
+                num += w * preds[name].point
+                den += w
+        return num / den if den > 0 else None
+
+    def interval_for(self, point: float, target_month: pd.Timestamp) -> dict:
+        group = "janfeb" if target_month.month in (1, 2) else "normal"
+        out = {}
+        for lv in self.cfg.interval_levels:
+            q = self.conformal_q.get((lv, group), np.nan)
+            out[lv] = (point - q, point + q)
+        return out
+# ==============================================================================
+# 第 15 节  驱动分解
+# ==============================================================================
+def sanity_clip(point: float, raw: dict, cfg: Config,
+                target_month: pd.Timestamp) -> tuple:
+    """极端值护栏：把点预测限制在"近12个月实际值范围 ± sanity_clip_pp"内。
+    防止 ML/桥接模型在基数效应/春节交互下产生 17~18 这类离谱外推。
+    返回 (clipped_point, was_clipped)。1-2月放宽护栏(其本身波动极大)。
+    """
+    s = raw[cfg.sheet_target].set_index("date")[
+        "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
+    s.index = to_month_index(s.index)
+    # 护栏范围基于近12个【非1-2月】实际值（剔除1-2月人造极值，否则范围被撑到无意义）
+    recent = s[~s.index.month.isin([1, 2])].loc[:target_month].tail(12)
+    if len(recent) < 6:
+        return point, False
+    pad = cfg.sanity_clip_pp * (2.5 if target_month.month in (1, 2) else 1.0)
+    lo, hi = recent.min() - pad, recent.max() + pad
+    clipped = float(np.clip(point, lo, hi))
+    return clipped, (abs(clipped - point) > 1e-6)
+# ==============================================================================
+# 第 15.5 节  1-2 月口径：累计同比(合并值) Theta 法预测
+# ==============================================================================
+def _theta_forecast(seq: np.ndarray) -> float:
+    """对一维序列用 Theta 法(statsmodels ThetaModel)做 1 步预测；失败则退化为随机游走。"""
+    from statsmodels.tsa.forecasting.theta import ThetaModel
+    seq = np.asarray(seq, float)
+    seq = seq[np.isfinite(seq)]
+    if len(seq) < 8:
+        return float(seq[-1]) if len(seq) else float("nan")
+    try:
+        m = ThetaModel(pd.Series(seq), period=1, deseasonalize=False).fit()
+        return float(m.forecast(1).iloc[0])
+    except Exception:
+        return float(seq[-1])  # 退化：随机游走(no-change)
+
+
+def forecast_janfeb_combined(raw: dict, cfg: Config,
+                             target_month: Optional[pd.Timestamp] = None) -> dict:
+    """预测【1-2 月累计同比(合并)】：Theta 法作用于累计同比序列，区间用高斯(误差RMSE)。
+
+    背景：NBS 不单独发布 1/2 月、合并于 3 月公布；拆分单月是人造噪声、近乎不可预测。
+    1-2 月合并(=每年 2 月的累计同比)是稳定、可预测的官方量。经"标准方法竞赛(RW/ARIMA/
+    ETS/Theta) + 高频桥接检验"实证：Theta 法(M3竞赛公认方法)与最优的随机游走几乎等价、优于
+    ARIMA/ETS，且为单一公认模型；高频桥接经检验反而帮倒忙，故不引入。
+
+    target_month：指定要预测的 2 月(月末)。None 时自动取序列下一个未发布累计月(Dec->Feb)。
+    无论指定与否，点预测仅用【严格早于目标月】的累计数据(hist)，杜绝前视。
+
+    返回 dict：target_label / target_month / point / intervals / calib_n / actual(若已公布)。
+    """
+    df = raw[cfg.sheet_target]
+    if cfg.ytd_col not in df.columns:
+        raise RuntimeError(f"汇总表缺少累计同比列：{cfg.ytd_col}（请确认使用含该列的汇总表）。")
+    s = df.set_index("date")[cfg.ytd_col]
+    s.index = to_month_index(s.index)
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    # 关键清洗：剔除【1 月】累计值。NBS 不单独发布 1 月累计(年内首个累计=2月的1-2月合并)；
+    # 汇总表中个别年份的 1 月累计是数据商填充的【杂散/错误值】(如 2024-01=26.3、2023-01=-9.79)，
+    # 若混入会污染序列、把 Theta/末值带飞。真实累计同比序列只含 2-12 月。
+    s = s[s.index.month != 1]
+    if len(s) < 24:
+        raise RuntimeError("累计同比样本不足(<24)，无法稳健预测 1-2 月合并值。")
+
+    # 目标累计月。指定则用之；否则取最后一个已发布累计月之后的下一个(中国累计无1月: Dec->Feb)。
+    if target_month is not None:
+        nxt = month_end(target_month)
+    else:
+        last = s.index.max()
+        nxt = month_end(last + pd.offsets.MonthBegin(1))
+        if nxt.month == 1:
+            nxt = month_end(nxt + pd.offsets.MonthBegin(1))
+    label = (f"{nxt.year}年1-2月累计同比(合并)" if nxt.month == 2
+             else f"{nxt.year}年1-{nxt.month}月累计同比")
+
+    # 点预测：Theta 法，仅用【严格早于目标月】的累计数据(实时安全；指定历史月回测亦无泄漏)。
+    hist = s[s.index < nxt]
+    if len(hist) < 24:
+        raise RuntimeError("目标月之前的累计同比样本不足(<24)，无法稳健预测。")
+    point = _theta_forecast(hist.values)
+
+    # 区间：高斯区间，尺度 σ = 最近 N 年 Theta 回测误差的 RMSE。两点处理使区间合理：
+    #   (1) 剔除结构断裂年(COVID)，避免极值把 σ 撑爆；
+    #   (2) 只取【最近 janfeb_calib_window 年】误差——高增长期波动远大于当前regime。
+    # 用高斯(而非经验分位数)：年度样本仅~12个，经验分位会让 80%/95% 几乎重合且过粗；高斯由
+    # σ 解析给出，80%/95% 正确分离，是小样本预测区间的标准做法(假设预测误差近似正态)。
+    from scipy.stats import norm
+    feb = s[s.index.month == nxt.month]
+    yr_err = []
+    for ts in feb.index:
+        hist = s[s.index < ts]
+        if len(hist) < 24 or ts.year in cfg.janfeb_break_years:
+            continue
+        yr_err.append((ts.year, _theta_forecast(hist.values) - float(feb.loc[ts])))
+    yr_err = sorted(yr_err)[-cfg.janfeb_calib_window:]          # 最近 N 年
+    errs = np.asarray([e for _, e in yr_err], float)
+    sigma = float(np.sqrt(np.mean(errs ** 2))) if len(errs) >= 3 else float("nan")
+    intervals = {}
+    for lv in cfg.interval_levels:
+        z = norm.ppf(0.5 + lv / 2)
+        hw = z * sigma if np.isfinite(sigma) else float("nan")
+        intervals[lv] = (point - hw, point + hw)
+
+    actual = float(s.loc[nxt]) if nxt in s.index and pd.notna(s.loc[nxt]) else None
+    return {"target_label": label, "target_month": nxt, "point": float(point),
+            "intervals": intervals, "calib_n": int(len(errs)),
+            "sigma": sigma,
+            "method": "Theta 法(statsmodels ThetaModel) 作用于累计同比序列",
+            "actual": actual}
+
+
+# ==============================================================================
+# 第 16 节  主流程
+# ==============================================================================
+def detect_target_month(raw: dict, cfg: Config) -> pd.Timestamp:
+    """自动确定预测月 = 目标变量最后一个非空月 + 1（"下一个未发布月"）。"""
+    s = raw[cfg.sheet_target].set_index("date")[
+        "中国:工业增加值:规模以上工业企业:当月同比(1-2月拆分)"].dropna()
+    last = month_end(s.index.max())
+    return month_end(last + pd.offsets.MonthBegin(1))
+
+
+def emit_result(label: str, caliber: str, point, interval80):
+    """【最终结果输出】用 print 打印(不受日志级别影响)：标签 + 口径 + 点预测 + 80% 区间，
+    并附【显示规则说明】。point 为 None 时(1 月口径)显示 "-"。
+    """
+    bar = "=" * 60
+    print(bar)
+    print(f"【预测结果】{label}")
+    print(f"  口径     : {caliber}")
+    if point is None:
+        print('  结果     : -   (1 月不单独发布，不预测)')
+    else:
+        print(f"  点预测   : {point:.2f} %")
+        if interval80 is not None and all(np.isfinite(x) for x in interval80):
+            print(f"  80% 区间 : [{interval80[0]:.2f}, {interval80[1]:.2f}]")
+    # 结果说明（按数据汇总表自动检测的"下个月"切换显示口径）
+    print("  ── 显示规则说明(按数据汇总表自动检测的'下个月'切换) ──")
+    print('     · 下个月 = 1 月    → 显示 "-"（1 月不单独发布、不预测）')
+    print("     · 下个月 = 2 月    → 显示【1-2 月累计同比(合并值)】")
+    print("     · 下个月 = 3-12 月 → 显示该月【当月同比】预测值")
+    print(bar)
+
+
+def run_january_blank(cfg: Config, raw: dict, target_month: pd.Timestamp) -> dict:
+    """目标月=1 月：NBS 不单独发布 1 月工业增加值，故【不预测】、显示 "-"。"""
+    caliber = "1月(不单独发布，不预测)"
+    emit_result(f"{target_month.year}年1月", caliber, None, None)
+    return {"target_month": str(target_month.date()), "caliber": caliber,
+            "display": "-", "point_forecast": None}
+
+
+def run_janfeb_pipeline(cfg: Config, raw: dict, run_date: pd.Timestamp,
+                        target_month: Optional[pd.Timestamp] = None) -> dict:
+    """目标月=2 月：用 Theta 法预测【1-2 月累计同比(合并)】，仅显示点预测 + 80% 区间。"""
+    res = forecast_janfeb_combined(raw, cfg, target_month=target_month)
+    lo_hi = res["intervals"].get(0.80)
+    emit_result(res["target_label"], "1-2月累计同比(合并)", res["point"], lo_hi)
+    return {"target_month": str(res["target_month"].date()),
+            "caliber": "1-2月累计同比(合并)", "display": round(res["point"], 2),
+            "lower_80": (round(lo_hi[0], 3) if lo_hi else None),
+            "upper_80": (round(lo_hi[1], 3) if lo_hi else None)}
+
+
+def main(cfg: Config = CFG):
+    # 简洁版默认静默：仅打印【最终结果 + 80%区间 + 说明】；过程日志(INFO)不显示。
+    # 如需调试看完整过程，设 cfg.verbose=True。
+    LOG.setLevel(logging.INFO if cfg.verbose else logging.WARNING)
+    LOG.info("工业增加值预测系统(简洁版) 启动")
+
+    indicators = build_indicator_dict(cfg)
+
+    # 1) 读取 + 校验
+    loader = DataLoader(cfg, indicators)
+    raw = loader.load()
+
+    # 1b) 预测时点不写死、不需外部采集日：数据前沿(表内最新日期)即 run_date，全部从表推断。
+    run_date = (pd.Timestamp(cfg.run_date) if cfg.run_date
+                else infer_collection_date(raw)).normalize()
+    # 目标月 = 数据汇总表自动检测的【下一个未发布月】(最后一个当月同比月 + 1)。
+    target_month = detect_target_month(raw, cfg)
+
+    # 1c) 显示口径按【检测到的下个月】切换：
+    #     · 下个月=1 月    -> 1 月不单独发布、不预测，显示 "-"；
+    #     · 下个月=2 月    -> 显示【1-2 月累计同比(合并)】(Theta 法，见第 15.5 节)；
+    #     · 下个月=3-12 月 -> 显示该月【当月同比】(下面的六模型集合)。
+    if target_month.month == 1:
+        LOG.info("目标月=%s：1 月不单独发布，不预测，显示 \"-\"。", target_month.date())
+        return run_january_blank(cfg, raw, target_month)
+    if target_month.month == 2:
+        LOG.info("目标月=%s：显示【1-2月累计同比(合并)】(Theta法)。", target_month.date())
+        return run_janfeb_pipeline(cfg, raw, run_date, target_month=target_month)
+
+    cfg.asof_gap_days = resolve_asof_gap(cfg, raw, target_month)
+    as_of_live = asof_for_target(cfg, target_month)   # == run_date（按构造）
+    LOG.info("采集日(run_date)=%s；实盘预测月=%s；as_of=%s（gap=%d天，与采集月是否=目标月无关）",
+             run_date.date(), target_month.date(), as_of_live.date(), cfg.asof_gap_days)
+    # 稳健性告警：仅靠表推断采集日，若表内混入杂散未来日期会把 run_date 带偏。gap 常规约
+    # 0-45 天；异常时提示检查（不改行为，可用 cfg.run_date 显式覆盖）。
+    if not (-5 <= cfg.asof_gap_days <= 45):
+        LOG.warning("as_of 间隔 gap=%d 天偏离常规(约0-45天)：请检查汇总表是否含异常/未来日期，"
+                    "或用 Config.run_date 显式指定采集日。", cfg.asof_gap_days)
+
+    # 2) 组装上下文
+    aligner = FrequencyAligner(cfg, raw, indicators)
+    fb = FeatureBuilder(cfg)
+    ctx = Context(cfg, aligner, fb)
+    _wire_context_cache(ctx)
+
+    # 2b) 标记实盘采集时点：对该 as_of，缓存代理强制用【全表(无pub_lag)】面板("自动更新表
+    #     出现即可得")，使各模型/数据质量报告的实盘行统一读到"表中已可得数据"，不被发布滞后过滤。
+    ctx.live_as_of = as_of_live
+
+    # 3) 模型集合 —— 六类机制并存，提供方法学多样性：
+    #    Autoregression(单变量惯性) + ElasticNet(线性高频桥接) + DiffusionIndex(PCA因子)
+    #    + LightGBM(非线性) + PartialLeastSquares(纯高频去相关) + DynamicFactorModel(状态空间).
+    #    全部纳入逆 MSE^2 加权(简洁版不做基准门控/DM检验)。
+    models = [
+        ModelAR(cfg),            # 名称=Autoregression：AR(p) BIC（单变量惯性，基准）
+        ModelARX(cfg),           # 名称=ElasticNet：AR滞后 + 高频外生弹性网回归
+        ModelDI(cfg),            # 名称=DiffusionIndex：AR滞后 + 高频PCA因子岭回归(Stock-Watson)
+    ]
+    if cfg.enable_probe_models:
+        models += [ModelLGB(cfg)]    # 名称=LightGBM：锚定 + 梯度提升残差（非线性）
+    if cfg.enable_pls:
+        models += [ModelPLS(cfg)]    # 名称=PartialLeastSquares：纯当月高频桥接(不锚AR)
+    if cfg.enable_dfm:
+        models += [ModelMFDFM(cfg)]  # 名称=DynamicFactorModel：状态空间Kalman因子+锚定AR岭回归
+    model_names = [m.name for m in models]
+
+    # 4) 回测（伪真实时点，无泄漏）—— 为组合权重与共形 80% 区间提供校准依据（必需）
+    bt = Backtester(cfg, ctx, models, raw).run()
+
+    # 5) 组合（逆 MSE^2 加权）+ 分裂共形 80% 区间
+    ens = Ensemble(cfg, model_names)
+    ens.fit(bt)
+
+    # 6) 实盘预测：下一个未发布月（当月同比）
+    per_model = {}
+    for mdl in models:
+        try:
+            per_model[mdl.name] = mdl.predict_asof(target_month, as_of_live, ctx)
+        except Exception as e:
+            LOG.warning("%s 实盘预测失败：%s", mdl.name, e)
+            per_model[mdl.name] = None
+
+    point = ens.combine_single(per_model)
+    if point is None:
+        print("所有模型均未给出有效预测。")
+        return None
+    point, _ = sanity_clip(point, raw, cfg, target_month)        # 极端值护栏
+    lo_hi = ens.interval_for(point, target_month).get(0.80)
+
+    # 7) 仅显示：点预测 + 80% 区间 + 说明（不落盘、不绘图、不出评估表）
+    emit_result(f"{month_end(target_month).year}年{target_month.month}月当月同比",
+                "当月同比", point, lo_hi)
+    return {"target_month": str(month_end(target_month).date()), "caliber": "当月同比",
+            "display": round(point, 2),
+            "lower_80": (round(lo_hi[0], 3) if lo_hi else None),
+            "upper_80": (round(lo_hi[1], 3) if lo_hi else None)}
+
+
+if __name__ == "__main__":
+    main()
