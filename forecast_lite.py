@@ -70,12 +70,14 @@
 
 运行
 ----
-    python industrial_va_forecast.py
-产出在 ./output/ ：点+区间预测表、回测评估表、扇形图、驱动分解、数据质量报告。
+    python forecast_lite.py
+简洁版【不产生任何文件/图形】，仅在控制台打印：点预测 + 80% 区间 + 显示规则说明。
+(数据表路径见 Config.excel_path；需含"累计同比"列以支持 2 月口径。)
 
 依赖
 ----
-    numpy pandas openpyxl scipy statsmodels scikit-learn lightgbm matplotlib
+    numpy pandas openpyxl scipy statsmodels scikit-learn lightgbm
+    （注：简洁版不绘图，无需 matplotlib）
 
 作者注
 ------
@@ -1498,6 +1500,8 @@ class Backtester:
             if (i + 1) % 6 == 0 or i == len(months) - 1:
                 LOG.info("  回测进度 %d/%d（最新 %s）", i + 1, len(months), tm.date())
         return pd.DataFrame(records).set_index("target_month")
+
+
 # ==============================================================================
 # 第 13 节  组合（逆误差加权）+ 分裂共形区间
 # ==============================================================================
@@ -1532,8 +1536,8 @@ class Ensemble:
             if m.sum() >= min_obs:
                 rmses[name] = np.sqrt(np.mean((p[m] - y[m]) ** 2))
         if not rmses:
-            # 兜底：回测样本极少 -> 退化为基准(若有)或所有可用模型等权（仍继续算共形）
-            LOG.warning("回测有效样本不足(n_eff=%d)，退化为基准/等权组合。", n_eff)
+            # 兜底：回测有效样本极少 -> 所有可用模型等权（仍继续计算共形区间）
+            LOG.warning("回测有效样本不足(n_eff=%d)，退化为等权组合。", n_eff)
             avail = [n for n in self.model_names if f"{n}__point" in bt
                      and bt[f"{n}__point"].notna().any()]
             if not avail:
@@ -1605,8 +1609,10 @@ class Ensemble:
             q = self.conformal_q.get((lv, group), np.nan)
             out[lv] = (point - q, point + q)
         return out
+
+
 # ==============================================================================
-# 第 15 节  驱动分解
+# 第 15 节  极端值护栏
 # ==============================================================================
 def sanity_clip(point: float, raw: dict, cfg: Config,
                 target_month: pd.Timestamp) -> tuple:
@@ -1625,6 +1631,8 @@ def sanity_clip(point: float, raw: dict, cfg: Config,
     lo, hi = recent.min() - pad, recent.max() + pad
     clipped = float(np.clip(point, lo, hi))
     return clipped, (abs(clipped - point) > 1e-6)
+
+
 # ==============================================================================
 # 第 15.5 节  1-2 月口径：累计同比(合并值) Theta 法预测
 # ==============================================================================
@@ -1816,7 +1824,7 @@ def main(cfg: Config = CFG):
     _wire_context_cache(ctx)
 
     # 2b) 标记实盘采集时点：对该 as_of，缓存代理强制用【全表(无pub_lag)】面板("自动更新表
-    #     出现即可得")，使各模型/数据质量报告的实盘行统一读到"表中已可得数据"，不被发布滞后过滤。
+    #     出现即可得")，使各模型的实盘行统一读到"表中已可得数据"，不被发布滞后过滤。
     ctx.live_as_of = as_of_live
 
     # 3) 模型集合 —— 六类机制并存，提供方法学多样性：
